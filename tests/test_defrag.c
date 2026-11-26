@@ -30,6 +30,23 @@ static IfsFsHostRuntimeV2 host(Disk *d,int writable){
         .maximum_transfer_bytes=65536,.context=d,.read_at=rd,.write_at=writable?wr:NULL,
         .flush=writable?fl:NULL,.allocate=al,.release=fr};
 }
+static uint32_t be32(const uint8_t *p){
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+static void prove_reserve(Disk *d,const IfsFsAllocationOpsV2 *a,void *vol,uint64_t first,uint64_t bytes){
+    uint64_t at=first,end=first+bytes;
+    while(at<end){
+        IfsFsAllocationRangeV2 r;uint32_t n=0;
+        assert(a->map(vol,at,&r,1,&n)==0&&n==1&&r.physical_offset==at&&r.state==IFS_FS_SPACE_RESERVED);
+        assert(r.length<=end-at);at+=r.length;
+    }
+    uint8_t sb[512];assert(pread(d->fd,sb,512,512)==512);
+    uint32_t bitmap=be32(sb+56);if(!bitmap)bitmap=2u;
+    for(uint64_t block=first/512;block<end/512;block++){
+        uint8_t bit;assert(pread(d->fd,&bit,1,(off_t)bitmap*512+(off_t)(block/8))==1);
+        assert(!(bit&(1u<<(block%8))));
+    }
+}
 static unsigned extents(const IfsFsDefragOpsV2 *m,void *v,const char *path,IfsFsExtentV2 *first){
     uint64_t at=0;unsigned count=0;
     for(;;){
@@ -50,12 +67,13 @@ int main(int argc,char **argv){
     const IfsFsCoreOpsV2 *c=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_CORE);
     const IfsFsVolumeOpsV2 *v=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_VOLUME);
     const IfsFsDefragOpsV2 *m=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_DEFRAG);
-    assert(m->header.capabilities==IFS_FS_DEFRAG_ALL);
+    const IfsFsAllocationOpsV2 *a=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_ALLOCATION);
+    assert(m->header.capabilities==IFS_FS_DEFRAG_ALL&&a&&a->map);
     uint8_t payload[PAYLOAD],readback[PAYLOAD],guard[GUARD];
     for(unsigned i=0;i<PAYLOAD;i++)payload[i]=(uint8_t)(i*19u+i/251u);
     char path[]="/tmp/efs-defrag-XXXXXX";Disk d={.fd=mkstemp(path)};
     assert(d.fd>=0&&unlink(path)==0&&ftruncate(d.fd,SIZE)==0);
-    for(d.sector=512;d.sector<=4096;d.sector*=8){
+    for(d.sector=512;d.sector<=4096;d.sector*=8)for(unsigned policy=0;policy<=10;policy+=10){
         IfsFsHostRuntimeV2 h=host(&d,1);
         assert(v->format(&h,0x72959,"DEFRAG",0)==0);
         void *volume=NULL;IfsFsVolumeInfoV2 info={.structure_bytes=sizeof info};
@@ -77,8 +95,8 @@ int main(int argc,char **argv){
         unsigned count=extents(m,volume,"/fragmented",&old);assert(count>1);
         uint64_t errors=99;assert(v->check(volume,0,&errors)==0&&!errors);
         unsigned writes=d.writes;void *plan=NULL;uint64_t moved=0;
-        assert(m->plan(volume,"/fragmented",10,&plan)==IFS_FS_UNSUPPORTED&&!plan&&d.writes==writes);
-        assert(m->plan(volume,"/fragmented",0,&plan)==0&&plan&&d.writes==writes);
+        assert(m->plan(volume,"/fragmented",99,&plan)==IFS_FS_UNSUPPORTED&&!plan&&d.writes==writes);
+        assert(m->plan(volume,"/fragmented",policy,&plan)==0&&plan&&d.writes==writes);
         assert(c->create(volume,"/blocked",IFS_FS_ENTRY_FILE)==IFS_FS_BUSY&&d.writes==writes);
         assert(c->unmount(volume)==IFS_FS_BUSY);
         assert(m->verify(volume,plan)==IFS_FS_BUSY);
@@ -86,11 +104,14 @@ int main(int argc,char **argv){
         assert(m->verify(volume,plan)==0);
         assert(extents(m,volume,"/fragmented",&now)==1&&now.length==sizeof payload);
         assert(now.physical_offset!=old.physical_offset);
+        uint64_t reserve_bytes=((PAYLOAD/512+9u)/10u)*512u;
+        if(policy)prove_reserve(&d,a,volume,now.physical_offset+PAYLOAD,reserve_bytes);
         m->release_plan(volume,plan);
         assert(m->verify(volume,plan)==IFS_FS_INVALID);
         assert(c->unmount(volume)==0);
         h=host(&d,0);assert(c->mount(&h,&volume,&info)==0);
         assert(extents(m,volume,"/fragmented",&now)==1);
+        if(policy)prove_reserve(&d,a,volume,now.physical_offset+PAYLOAD,reserve_bytes);
         assert(c->read(volume,"/fragmented",0,readback,sizeof readback)==0&&!memcmp(payload,readback,sizeof payload));
         assert(pread(d.fd,readback,sizeof readback,(off_t)now.physical_offset)==sizeof readback);
         assert(!memcmp(payload,readback,sizeof payload));
@@ -101,7 +122,26 @@ int main(int argc,char **argv){
         }
         assert(v->check(volume,0,&errors)==0&&!errors);
         assert(c->unmount(volume)==0);
-        printf("EFS physical relocation PASS sector=%u old_extents=%u new_extents=1\n",d.sector,count);
+        if(policy){
+            h=host(&d,1);assert(c->mount(&h,&volume,&info)==0);
+            assert(c->create(volume,"/.ifs-growth",IFS_FS_ENTRY_FILE)==IFS_FS_ACCESS);
+            assert(c->remove(volume,"/.ifs-growth")==IFS_FS_ACCESS);
+            assert(c->create(volume,"/new",IFS_FS_ENTRY_FILE)==0);
+            assert(c->write(volume,"/new",0,guard,sizeof guard)==0);
+            prove_reserve(&d,a,volume,now.physical_offset+PAYLOAD,reserve_bytes);
+            assert(m->plan(volume,"/",10,&plan)==0&&plan);
+            assert(m->execute(volume,plan,&moved)==0&&m->verify(volume,plan)==0);
+            m->release_plan(volume,plan);
+            for(unsigned i=1;i<16;i+=2){
+                snprintf(name,sizeof name,"/block%02u",i);
+                assert(extents(m,volume,name,&now)==1);
+                prove_reserve(&d,a,volume,now.physical_offset+GUARD,((GUARD/512+9u)/10u)*512u);
+            }
+            assert(c->remove(volume,"/fragmented")==0);
+            assert(v->check(volume,0,&errors)==0&&!errors);
+            assert(c->unmount(volume)==0);
+        }
+        printf("EFS physical relocation PASS sector=%u policy=%u old_extents=%u new_extents=1\n",d.sector,policy,count);
     }
     assert(close(d.fd)==0);dlclose(so);return 0;
 }

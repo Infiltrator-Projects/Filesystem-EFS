@@ -41,6 +41,7 @@ typedef struct {
 static Session session;
 static uintptr_t generation,active_plan;
 static int plan_executing;
+static const uint8_t *plan_avoid;
 static atomic_flag gate=ATOMIC_FLAG_INIT;
 static int enter(void){return !atomic_flag_test_and_set_explicit(&gate,memory_order_acquire);}
 static int leave(int rc){atomic_flag_clear_explicit(&gate,memory_order_release);return rc;}

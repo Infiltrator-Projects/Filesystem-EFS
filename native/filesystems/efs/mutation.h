@@ -89,7 +89,8 @@ static int allocate_runs(Mutation *m,uint32_t blocks,Runs *r)
         uint32_t end=session.g.first+(cg+1u)*session.g.group;
         for(;b<end && logical<blocks;b++){
             if((b&4095u)==0 && cancelled(mh()))return IFS_FS_BUSY;
-            if(!free_bit(session.bitmap,b)||!free_bit(m->bitmap,b))continue;
+            if(!free_bit(session.bitmap,b)||!free_bit(m->bitmap,b)||
+               (plan_executing&&plan_avoid&&free_bit(plan_avoid,b)))continue;
             Extent *last=r->count?&r->e[r->count-1u]:NULL;
             if(last && last->count<255u && last->physical+last->count==b &&
                (last->physical-session.g.first)/session.g.group==cg)++last->count;
@@ -103,6 +104,27 @@ static int allocate_runs(Mutation *m,uint32_t blocks,Runs *r)
     }
     return logical==blocks?IFS_FS_OK:IFS_FS_NO_SPACE;
 }
+/* Exact contiguous native run; split only at the 255-block record limit. */
+static int exact_runs(Mutation *m,uint32_t start,uint32_t blocks,int allocate,Runs *r)
+{
+    *r=(Runs){0};
+    if(!blocks)return IFS_FS_OK;
+    if(!data_block(&session.g,start)||blocks>session.g.size-start||
+       blocks>session.g.group-(start-session.g.first)%session.g.group)
+        return IFS_FS_INVALID;
+    r->capacity=(blocks+254u)/255u;
+    if(r->capacity>32767u)return IFS_FS_NO_SPACE;
+    r->e=mem_new((size_t)r->capacity*sizeof(*r->e));if(!r->e)return IFS_FS_NO_MEMORY;
+    for(uint32_t i=0;i<blocks;i++){
+        uint32_t b=start+i;
+        if(allocate){int rc=mark_allocated(m,b);if(rc)return rc;}
+        else if(free_bit(session.bitmap,b)||free_bit(m->bitmap,b))return IFS_FS_CORRUPT;
+        if(!i||r->e[r->count-1u].count==255u)
+            r->e[r->count++]=(Extent){.physical=b,.logical=i,.count=1};
+        else ++r->e[r->count-1u].count;
+    }
+    return IFS_FS_OK;
+}
 static void encode_extent(uint8_t *p,const Extent *e,uint32_t logical)
 {
     p[0]=0;p[1]=(uint8_t)(e->physical>>16);p[2]=(uint8_t)(e->physical>>8);
@@ -111,12 +133,18 @@ static void encode_extent(uint8_t *p,const Extent *e,uint32_t logical)
 }
 /* Free only data owned by the original inode, including its native
  * indirect tables. The allocator will not reuse these blocks this tx. */
+static int release_tables(Mutation *m,const Inode *ino);
 static int release_old(Mutation *m,const Inode *ino,const Extent *old)
 {
     int rc;
     for(uint32_t i=0;i<ino->count;i++){
         rc=release_extent(m,&old[i]);if(rc)return rc;
     }
+    return release_tables(m,ino);
+}
+static int release_tables(Mutation *m,const Inode *ino)
+{
+    int rc;
     if(ino->count>DIRECT){
         uint32_t tables=be24(ino->descriptors+5);
         for(uint32_t i=0;i<tables;i++){
@@ -335,6 +363,79 @@ static int replace_directory(Mutation *m,Object *o,const Names *n)
     if(!rc)rc=replace_stream(m,o,bytes,memory_source,p);
     mem_drop(p);return rc;
 }
+static void put_hex32(char *p,uint32_t n)
+{
+    static const char hex[]="0123456789abcdef";
+    for(unsigned i=0;i<8;i++)p[i]=hex[(n>>(28u-i*4u))&15u];
+}
+static Dirent reserve_name(const Object *target,uint32_t ino)
+{
+    Dirent e={.ino=ino,.len=17,.name="r"};
+    put_hex32(e.name+1,target->old.ino);put_hex32(e.name+9,be32(target->raw+24));
+    return e;
+}
+static int reservation_directory(Object *dir,Names *names)
+{
+    if(!session.reserve_dir)return IFS_FS_UNSUPPORTED;
+    int rc=load_object(session.reserve_dir,dir);
+    if(!rc)rc=load_names(&dir->old,names);
+    return rc;
+}
+static int reservation_owner(const Reservation *r,Object *o)
+{return r?load_object(r->inode,o):IFS_FS_NOT_FOUND;}
+/* A native ordinary inode owns each zero-filled reserve block. */
+static int reservation_create(Mutation *m,const Object *target,const Runs *runs,uint32_t count)
+{
+    const Reservation *previous=reservation_for(&session,target->old.ino);
+    Object owner,dir;Names names={0};Extent *old=NULL;
+    int rc=previous?reservation_owner(previous,&owner):new_inode(m,IFS_FS_ENTRY_FILE,&owner);
+    if(rc)goto done;
+    put16(owner.raw,0100600u);
+    rc=extents(&session,&owner.old,&old);if(rc)goto done;
+    rc=build_descriptors(m,&owner,runs);if(rc)goto done;
+    for(uint32_t i=0;i<runs->count&&!rc;i++)
+        for(uint32_t k=0;k<runs->e[i].count;k++){
+            uint8_t zero[BB]={0};
+            if(cancelled(mh())){rc=IFS_FS_BUSY;break;}
+            rc=write_new_block(m,runs->e[i].physical+k,zero);if(rc)break;
+        }
+    if(!rc)rc=release_old(m,&owner.old,old);
+    if(!rc){
+        put32(owner.raw+8,count*BB);stamp(owner.raw,!previous);
+        rc=stage_inode(m,owner.old.ino,owner.raw);
+    }
+    if(!rc&&!previous){
+        rc=reservation_directory(&dir,&names);
+        Dirent e=reserve_name(target,owner.old.ino);
+        if(!rc)rc=names_append(&names,&e);
+        if(!rc)rc=replace_directory(m,&dir,&names);
+    }
+done:
+    mem_drop(old);names_drop(&names);return rc;
+}
+static int reservation_delete(Mutation *m,uint32_t target,int release_data)
+{
+    const Reservation *r=reservation_for(&session,target);
+    if(!r)return IFS_FS_OK;
+    Object owner,dir;Names names={0};Extent *old=NULL;
+    int rc=reservation_owner(r,&owner);if(rc)goto done;
+    if(release_data){
+        rc=extents(&session,&owner.old,&old);
+        if(!rc)rc=release_old(m,&owner.old,old);
+    }else rc=release_tables(m,&owner.old);
+    if(rc)goto done;
+    rc=reservation_directory(&dir,&names);if(rc)goto done;
+    uint32_t i=0;while(i<names.count&&names.e[i].ino!=r->inode)++i;
+    if(i==names.count){rc=IFS_FS_CORRUPT;goto done;}
+    names_remove(&names,i);
+    uint32_t gen=be32(owner.raw+24);
+    memset(owner.raw,0,DINODE);put32(owner.raw+24,gen);
+    ++m->free_inodes;
+    rc=stage_inode(m,owner.old.ino,owner.raw);
+    if(!rc)rc=replace_directory(m,&dir,&names);
+done:
+    mem_drop(old);names_drop(&names);return rc;
+}
 static int resolve_parent(const char *path,Object *parent,Dirent *leaf)
 {
     if(!path||path[0]!='/')return IFS_FS_INVALID;
@@ -392,6 +493,7 @@ static int write_impl(void *v,const char *path,uint64_t at,const void *p,uint32_
     if(!rc && n){
         rc=load_object(ino.ino,&o);
         uint32_t bytes=ino.bytes>at+n?ino.bytes:(uint32_t)(at+n);
+        if(!rc)rc=reservation_delete(&m,ino.ino,1);
         if(!rc)rc=replace_file(&m,&o,bytes,(uint32_t)at,p,n);
         if(!rc)rc=mutation_commit(&m);
     }
@@ -406,6 +508,7 @@ static int truncate_impl(void *v,const char *path,uint64_t bytes)
     if(!rc && ino.type!=IFS_FS_ENTRY_FILE)rc=IFS_FS_UNSUPPORTED;
     if(!rc && bytes!=ino.bytes){
         rc=load_object(ino.ino,&o);
+        if(!rc)rc=reservation_delete(&m,ino.ino,1);
         if(!rc)rc=replace_file(&m,&o,(uint32_t)bytes,0,NULL,0);
         if(!rc)rc=mutation_commit(&m);
     }
@@ -429,7 +532,8 @@ static int remove_impl(void *v,const char *path)
         rc=change_links(&child,-1);
         if(!rc)rc=stage_inode(&m,child.old.ino,child.raw);
     }else{
-        rc=extents(&session,&child.old,&old);
+        rc=reservation_delete(&m,child.old.ino,1);
+        if(!rc)rc=extents(&session,&child.old,&old);
         if(!rc)rc=release_old(&m,&child.old,old);
         if(!rc){
             uint32_t gen=be32(child.raw+24);

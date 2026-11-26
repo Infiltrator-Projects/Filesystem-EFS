@@ -5,13 +5,14 @@
  * No caller supplies physical locations or interprets extent metadata.
  */
 typedef struct {
-    uint32_t ino,bytes,start,crc;
-    int move;
+    uint32_t ino,bytes,start,crc,growth;
+    int move,reserve_only;
 } PlanFile;
 typedef struct {
     uintptr_t token;
     PlanFile *files;
-    uint32_t count,capacity,next;
+    uint8_t *avoid;
+    uint32_t count,capacity,next,policy;
     uint64_t moved;
     int complete;
 } DefragPlan;
@@ -146,8 +147,72 @@ static int simulate_file(uint8_t *bitmap,PlanFile *f)
 done:
     mem_drop(old);return rc;
 }
+/* Preflight protects every planned target from metadata allocation.
+ * Conservatively keep all old allocations occupied in the simulation. */
+static int free_run_at(const uint8_t *bitmap,uint32_t start,uint32_t count)
+{
+    if(!count||!data_block(&session.g,start)||count>session.g.size-start||
+       count>session.g.group-(start-session.g.first)%session.g.group)return 0;
+    for(uint32_t i=0;i<count;i++)if(!free_bit(bitmap,start+i))return 0;
+    return 1;
+}
+static void reserve_plan_run(uint8_t *bitmap,uint8_t *avoid,uint32_t start,uint32_t n)
+{
+    for(uint32_t i=0;i<n;i++){sim_alloc(bitmap,start+i);set_free(avoid,start+i);}
+}
+static int simulate_growth(uint8_t *bitmap,uint8_t *avoid,PlanFile *f,
+                           uint32_t *new_owners,uint64_t *extra)
+{
+    Inode ino;int rc=inode_load(&session,f->ino,&ino);if(rc)return rc;
+    if(ino.type!=IFS_FS_ENTRY_FILE)return IFS_FS_CORRUPT;
+    f->bytes=ino.bytes;Extent *old=NULL;rc=extents(&session,&ino,&old);if(rc)return rc;
+    rc=inode_crc(&ino,old,&f->crc);if(rc)goto done;
+    uint32_t blocks=(ino.bytes+BB-1u)/BB,start=0,dest=0;
+    int whole=contiguous(&ino,old,&start);f->start=start;
+    if(!blocks)goto done;
+    f->growth=(blocks+9u)/10u;
+    const Reservation *r=reservation_for(&session,ino.ino);
+    if(r&&whole&&r->count==f->growth)goto done;
+    if(!r && whole && free_run_at(bitmap,start+blocks,f->growth)){
+        f->reserve_only=1;reserve_plan_run(bitmap,avoid,start+blocks,f->growth);
+    }else{
+        rc=choose_run(bitmap,blocks+f->growth,&dest);if(rc)goto done;
+        f->start=dest;f->move=1;
+        reserve_plan_run(bitmap,avoid,dest,blocks+f->growth);
+        uint32_t n=(blocks+254u)/255u;
+        if(n>DIRECT)*extra+=(n+63u)/64u;
+    }
+    if(!r)++*new_owners;
+    uint32_t n=(f->growth+254u)/255u;
+    if(n>DIRECT)*extra+=(n+63u)/64u;
+done:
+    mem_drop(old);return rc;
+}
+static int growth_preflight(uint8_t *bitmap,DefragPlan *p)
+{
+    if(!session.reserve_dir)return IFS_FS_UNSUPPORTED;
+    uint32_t owners=0;uint64_t extra=0;int rc=IFS_FS_OK;
+    for(uint32_t i=0;i<p->count;i++){
+        rc=simulate_growth(bitmap,p->avoid,&p->files[i],&owners,&extra);if(rc)return rc;
+    }
+    if(owners>session.g.free_inodes)return IFS_FS_NO_SPACE;
+    if(owners){
+        Inode dir;rc=inode_load(&session,session.reserve_dir,&dir);if(rc)return rc;
+        /* One whole block per new name is a conservative upper bound. */
+        uint64_t dir_blocks=(uint64_t)dir.bytes/BB+owners;
+        extra+=dir_blocks+(dir_blocks+63u)/64u;
+    }
+    uint64_t free=0;
+    for(uint32_t cg=0;cg<session.g.groups;cg++){
+        uint32_t start=session.g.first+cg*session.g.group+session.g.inodes;
+        uint32_t end=session.g.first+(cg+1u)*session.g.group;
+        if(cancelled(mh()))return IFS_FS_BUSY;
+        for(uint32_t b=start;b<end;b++)free+=(unsigned)free_bit(bitmap,b);
+    }
+    return free<extra?IFS_FS_NO_SPACE:IFS_FS_OK;
+}
 static void plan_drop(DefragPlan *p)
-{if(p){mem_drop(p->files);mem_drop(p);}}
+{if(p){mem_drop(p->files);mem_drop(p->avoid);mem_drop(p);}}
 static int plan_impl(void *v,const char *path,uint32_t policy,void **out)
 {
     if(!out)return IFS_FS_INVALID;
@@ -155,9 +220,7 @@ static int plan_impl(void *v,const char *path,uint32_t policy,void **out)
     if(!live(v))return IFS_FS_INVALID;
     if(!session.writable)return IFS_FS_ACCESS;
     if(active_plan)return IFS_FS_BUSY;
-    /* Policy 10 requires an actual persistent native reservation. Do
-     * not advertise ordinary contiguous free space as a reserved extent. */
-    if(policy)return IFS_FS_UNSUPPORTED;
+    if(policy!=0u&&policy!=10u)return IFS_FS_UNSUPPORTED;
     if(plan_generation==UINTPTR_MAX)return IFS_FS_NO_SPACE;
     int rc=check_native(&session);if(rc)return rc;
     Inode root;Dirent ent;rc=resolve(&session,path,&root,&ent);if(rc)return rc;
@@ -170,10 +233,18 @@ static int plan_impl(void *v,const char *path,uint32_t policy,void **out)
     if(!p||!bitmap||!seen){
         mem_drop(p);mem_drop(bitmap);mem_drop(seen);return IFS_FS_NO_MEMORY;
     }
-    *p=(DefragPlan){0};memset(seen,0,(total+7u)/8u);
+    *p=(DefragPlan){.policy=policy};memset(seen,0,(total+7u)/8u);
     memcpy(bitmap,session.bitmap,session.g.bitmap_bytes);
+    if(policy){
+        p->avoid=mem_new(session.g.bitmap_bytes);
+        if(!p->avoid){mem_drop(bitmap);mem_drop(seen);plan_drop(p);return IFS_FS_NO_MEMORY;}
+        memset(p->avoid,0,session.g.bitmap_bytes);
+    }
     rc=plan_collect(p,seen,root.ino,0);
-    if(!rc)for(uint32_t i=0;i<p->count;i++){rc=simulate_file(bitmap,&p->files[i]);if(rc)break;}
+    if(!rc && policy)rc=growth_preflight(bitmap,p);
+    if(!rc && !policy)for(uint32_t i=0;i<p->count;i++){
+        rc=simulate_file(bitmap,&p->files[i]);if(rc)break;
+    }
     mem_drop(bitmap);mem_drop(seen);
     if(rc){plan_drop(p);return rc;}
     p->token=++plan_generation;active_plan=p->token;plan_state=p;
@@ -188,6 +259,11 @@ static int verify_file(const PlanFile *f)
     if(!contiguous(&ino,ext,&start)||start!=f->start)rc=IFS_FS_CORRUPT;
     if(!rc)rc=inode_crc(&ino,ext,&crc);
     if(!rc && crc!=f->crc)rc=IFS_FS_CORRUPT;
+    if(!rc && f->growth){
+        const Reservation *r=reservation_for(&session,f->ino);
+        if(!r||r->count!=f->growth||r->start!=f->start+(f->bytes+BB-1u)/BB)
+            rc=IFS_FS_CORRUPT;
+    }
     mem_drop(ext);return rc;
 }
 static int relocate_file(void *v,const PlanFile *f)
@@ -199,34 +275,30 @@ static int relocate_file(void *v,const PlanFile *f)
     if(!rc && crc!=f->crc)rc=IFS_FS_CORRUPT;
     if(rc){mem_drop(old);return rc;}
     Mutation m;rc=mutation_begin(&m,v);if(rc){mem_drop(old);return rc;}
-    Runs runs={0};
+    Runs data={0},reserve={0};
     uint32_t blocks=(f->bytes+BB-1u)/BB;
-    runs.capacity=(blocks+254u)/255u;
-    runs.e=mem_new((size_t)runs.capacity*sizeof(*runs.e));
-    if(!runs.e){rc=IFS_FS_NO_MEMORY;goto done;}
-    for(uint32_t i=0;i<blocks;i++){
-        uint32_t b=f->start+i;
-        if(!data_block(&session.g,b)||!free_bit(session.bitmap,b)){
-            rc=IFS_FS_CORRUPT;goto done;
+    if(f->move)rc=exact_runs(&m,f->start,blocks,1,&data);
+    else {
+        uint32_t start=0;
+        if(!contiguous(&o.old,old,&start)||start!=f->start)rc=IFS_FS_CORRUPT;
+    }
+    if(!rc && f->growth)rc=exact_runs(&m,f->start+blocks,f->growth,1,&reserve);
+    if(rc)goto done;
+    if(f->move){
+        rc=build_descriptors(&m,&o,&data);if(rc)goto done;
+        FileSource source={.old=&o.old,.ext=old,.bytes=f->bytes};
+        for(uint32_t i=0;i<blocks;i++){
+            if(cancelled(mh())){rc=IFS_FS_BUSY;goto done;}
+            uint8_t p[BB]={0};rc=file_source(&source,i,p);if(rc)goto done;
+            rc=write_new_block(&m,f->start+i,p);if(rc)goto done;
         }
-        rc=mark_allocated(&m,b);if(rc)goto done;
-        if(!i || runs.e[runs.count-1u].count==255u)
-            runs.e[runs.count++]=(Extent){.physical=b,.logical=i,.count=1};
-        else ++runs.e[runs.count-1u].count;
+        rc=release_old(&m,&o.old,old);if(rc)goto done;
+        rc=stage_inode(&m,o.old.ino,o.raw);
     }
-    rc=build_descriptors(&m,&o,&runs);if(rc)goto done;
-    FileSource source={.old=&o.old,.ext=old,.bytes=f->bytes};
-    for(uint32_t i=0;i<blocks;i++){
-        if(cancelled(mh())){rc=IFS_FS_BUSY;goto done;}
-        uint8_t p[BB]={0};rc=file_source(&source,i,p);if(rc)goto done;
-        rc=write_new_block(&m,f->start+i,p);if(rc)goto done;
-    }
-    rc=release_old(&m,&o.old,old);if(rc)goto done;
-    /* Logical file data and timestamps do not change during relocation. */
-    rc=stage_inode(&m,o.old.ino,o.raw);
+    if(!rc && f->growth)rc=reservation_create(&m,&o,&reserve,f->growth);
     if(!rc)rc=mutation_commit(&m);
 done:
-    runs_drop(&runs);mutation_end(&m);mem_drop(old);return rc;
+    runs_drop(&data);runs_drop(&reserve);mutation_end(&m);mem_drop(old);return rc;
 }
 static int plan_matches(void *v,void *p)
 {return live(v)&&p&&active_plan==(uintptr_t)p&&plan_state&&plan_state->token==(uintptr_t)p;}
@@ -238,18 +310,18 @@ static int execute_impl(void *v,void *p,uint64_t *moved)
     DefragPlan *q=plan_state;
     if(q->complete){*moved=q->moved;return IFS_FS_OK;}
     int rc=IFS_FS_OK;
-    plan_executing=1;
+    plan_executing=1;plan_avoid=q->avoid;
     while(q->next<q->count){
         if(cancelled(mh())){rc=IFS_FS_BUSY;break;}
         PlanFile *f=&q->files[q->next];
-        if(f->move){
+        if(f->move||f->reserve_only){
             rc=relocate_file(v,f);if(rc)break;
-            q->moved+=f->bytes;
+            if(f->move)q->moved+=f->bytes;
         }
         rc=verify_file(f);if(rc){session.fault=1;break;}
         ++q->next;
     }
-    plan_executing=0;
+    plan_executing=0;plan_avoid=NULL;
     if(!rc)q->complete=1;
     *moved=q->moved;return rc;
 }
@@ -260,7 +332,8 @@ static int verify_impl(void *v,void *p)
     for(uint32_t i=0;i<plan_state->count;i++){
         int rc=verify_file(&plan_state->files[i]);if(rc)return rc;
     }
-    return check_native(&session);
+    uint64_t errors=0;int rc=check_impl(v,0,&errors);
+    return rc?rc:errors?IFS_FS_CORRUPT:IFS_FS_OK;
 }
 static void release_impl(void *v,void *p)
 {
