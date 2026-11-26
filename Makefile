@@ -26,7 +26,10 @@ build/test_namespace_recovery: tests/test_namespace_recovery.c
 build/test_defrag: tests/test_defrag.c
 	mkdir -p build
 	$(CC) $(BASE) $(CFLAGS) -o $@ $< -ldl
-check: all build/test_efs build/test_format build/test_journal build/test_namespace build/test_namespace_recovery build/test_defrag
+build/test_defrag_recovery: tests/test_defrag_recovery.c
+	mkdir -p build
+	$(CC) $(BASE) $(CFLAGS) -o $@ $< -ldl
+check: all build/test_efs build/test_format build/test_journal build/test_namespace build/test_namespace_recovery build/test_defrag build/test_defrag_recovery
 	test "$$(nm -D --defined-only build/EFS.so | awk '{print $$3}')" = infiltrator_filesystem_api_v2
 	build/test_efs ./build/EFS.so
 	build/test_format ./build/EFS.so
@@ -34,5 +37,6 @@ check: all build/test_efs build/test_format build/test_journal build/test_namesp
 	build/test_namespace ./build/EFS.so
 	build/test_namespace_recovery ./build/EFS.so
 	build/test_defrag ./build/EFS.so
+	build/test_defrag_recovery ./build/EFS.so
 clean:
 	rm -rf build
