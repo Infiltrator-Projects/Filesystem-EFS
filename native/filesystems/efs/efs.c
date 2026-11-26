@@ -25,12 +25,18 @@ typedef struct {
     uint8_t descriptors[DIRECT*8];
 } Inode;
 typedef struct {
+    uint32_t target,generation,inode,start,count;
+} Reservation;
+#define RESERVE_DIR ".ifs-growth"
+typedef struct {
     IfsFsHostRuntimeV2 host;
     Geometry g;
     uint8_t *bitmap;
     uintptr_t token;
-    int writable,fault;
+    int writable,fault,journal_owned;
     uint64_t recovered;
+    uint32_t reserve_dir,reserve_count,reserve_capacity;
+    Reservation *reserves;
 } Session;
 static Session session;
 static uintptr_t generation,active_plan;
@@ -309,11 +315,13 @@ static int directory_walk(const Session *s,const Inode *dir,DirVisit visit,void 
     if(ext)s->host.release(s->host.context,ext);
     return rc;
 }
-typedef struct { const char *name;uint32_t len,index,visible,found;Dirent *out; } Find;
+static int internal_name(const char *p,uint32_t n)
+{return n==sizeof(RESERVE_DIR)-1u&&!memcmp(p,RESERVE_DIR,n);}
+typedef struct { const char *name;uint32_t len,index,visible,found;Dirent *out;int hide_internal; } Find;
 static int find_visit(void *ctx,const Dirent *e)
 {
     Find *f=ctx;
-    if(dot_kind(e))return IFS_FS_OK;
+    if(dot_kind(e)||(f->hide_internal&&internal_name(e->name,e->len)))return IFS_FS_OK;
     int match=f->name?(f->len==e->len && !memcmp(f->name,e->name,e->len)):
         f->visible==f->index;
     ++f->visible;
@@ -326,10 +334,135 @@ static int find_visit(void *ctx,const Dirent *e)
 static int directory_find(const Session *s,const Inode *dir,const char *name,
                           uint32_t len,uint32_t index,Dirent *out)
 {
-    Find f={.name=name,.len=len,.index=index,.out=out};
+    Find f={.name=name,.len=len,.index=index,.out=out,
+        .hide_internal=s->journal_owned&&dir->ino==ROOT};
     int rc=directory_walk(s,dir,find_visit,&f);
     if(rc)return rc;
     return f.found?IFS_FS_OK:name?IFS_FS_NOT_FOUND:IFS_FS_END;
+}
+/* Actual growth reserves are regular native allocated files in a
+ * provider-owned directory. This keeps the EFS bitmap and native inode
+ * ownership consistent for independent readers and fsck. The directory
+ * is hidden/protected only on provider-journalled media. Each entry name
+ * binds the target inode and its generation; the data extent must be
+ * physically adjacent to the target's contiguous allocated stream. */
+static int hex32(const char *p,uint32_t *value)
+{
+    uint32_t v=0;
+    for(unsigned i=0;i<8;i++){
+        unsigned char c=(unsigned char)p[i];uint32_t n;
+        if(c>='0'&&c<='9')n=c-'0';
+        else if(c>='a'&&c<='f')n=c-'a'+10u;
+        else return IFS_FS_CORRUPT;
+        v=(v<<4)|n;
+    }
+    *value=v;return IFS_FS_OK;
+}
+static int physical_run(const Inode *ino,const Extent *e,uint32_t *start)
+{
+    *start=0;
+    if(!ino->count)return !ino->bytes;
+    *start=e[0].physical;
+    for(uint32_t i=1;i<ino->count;i++)
+        if(e[i-1u].physical+e[i-1u].count!=e[i].physical)return 0;
+    return 1;
+}
+static void reservations_drop(Session *s)
+{
+    if(s->reserves)s->host.release(s->host.context,s->reserves);
+    s->reserves=NULL;s->reserve_count=s->reserve_capacity=s->reserve_dir=0;
+}
+static int reserve_root_visit(void *ctx,const Dirent *e)
+{
+    Session *s=ctx;
+    if(!internal_name(e->name,e->len))return IFS_FS_OK;
+    if(s->reserve_dir)return IFS_FS_CORRUPT;
+    s->reserve_dir=e->ino;return IFS_FS_OK;
+}
+static int reserve_entry_visit(void *ctx,const Dirent *e)
+{
+    Session *s=ctx;const IfsFsHostRuntimeV2 *h=&s->host;
+    if(dot_kind(e))return IFS_FS_OK;
+    if(e->len!=17u||e->name[0]!='r')return IFS_FS_CORRUPT;
+    Reservation r={.inode=e->ino};
+    int rc=hex32(e->name+1,&r.target);if(rc)return rc;
+    rc=hex32(e->name+9,&r.generation);if(rc)return rc;
+    if(r.target==r.inode||r.target==s->reserve_dir||r.target==ROOT)return IFS_FS_CORRUPT;
+    for(uint32_t i=0;i<s->reserve_count;i++)
+        if(s->reserves[i].target==r.target||s->reserves[i].inode==r.inode)
+            return IFS_FS_CORRUPT;
+    Inode target,reserve;uint8_t raw[DINODE];
+    rc=inode_raw(s,r.target,raw);if(rc)return rc;
+    if(be32(raw+24)!=r.generation)return IFS_FS_CORRUPT;
+    rc=inode_decode(r.target,raw,&target);if(rc)return rc;
+    rc=inode_raw(s,r.inode,raw);if(rc)return rc;
+    if(be16(raw+2)!=1u)return IFS_FS_CORRUPT;
+    rc=inode_decode(r.inode,raw,&reserve);if(rc)return rc;
+    if(target.type!=IFS_FS_ENTRY_FILE||reserve.type!=IFS_FS_ENTRY_FILE||
+       !target.bytes||!reserve.bytes||reserve.bytes%BB)return IFS_FS_CORRUPT;
+    Extent *a=NULL,*b=NULL;uint32_t first=0;
+    rc=extents(s,&target,&a);
+    if(!rc)rc=extents(s,&reserve,&b);
+    if(!rc){
+        uint32_t blocks=(target.bytes+BB-1u)/BB;
+        r.count=reserve.bytes/BB;
+        if(!physical_run(&target,a,&first)||!physical_run(&reserve,b,&r.start)||
+           r.start!=first+blocks||r.count>(blocks+9u)/10u)rc=IFS_FS_CORRUPT;
+    }
+    if(a)h->release(h->context,a);
+    if(b)h->release(h->context,b);
+    if(rc)return rc;
+    if(s->reserve_count==s->reserve_capacity){
+        uint32_t next=s->reserve_capacity?s->reserve_capacity*2u:16u;
+        if(next<s->reserve_capacity||next>UINT32_MAX/sizeof(Reservation))return IFS_FS_NO_MEMORY;
+        Reservation *p=h->allocate(h->context,(size_t)next*sizeof(*p));
+        if(!p)return IFS_FS_NO_MEMORY;
+        if(s->reserve_count)memcpy(p,s->reserves,(size_t)s->reserve_count*sizeof(*p));
+        if(s->reserves)h->release(h->context,s->reserves);
+        s->reserves=p;s->reserve_capacity=next;
+    }
+    s->reserves[s->reserve_count++]=r;return IFS_FS_OK;
+}
+static int reserve_compare(const void *a,const void *b)
+{
+    uint32_t x=((const Reservation*)a)->start,y=((const Reservation*)b)->start;
+    return x<y?-1:x>y?1:0;
+}
+static int reservations_reload(Session *s)
+{
+    reservations_drop(s);
+    if(!s->journal_owned)return IFS_FS_OK;
+    Inode root,dir;int rc=inode_load(s,ROOT,&root);
+    if(!rc)rc=directory_walk(s,&root,reserve_root_visit,s);
+    if(!rc && s->reserve_dir){
+        rc=inode_load(s,s->reserve_dir,&dir);
+        if(!rc&&dir.type!=IFS_FS_ENTRY_DIRECTORY)rc=IFS_FS_CORRUPT;
+        if(!rc)rc=directory_walk(s,&dir,reserve_entry_visit,s);
+    }
+    if(!rc && s->reserve_count){
+        qsort(s->reserves,s->reserve_count,sizeof(*s->reserves),reserve_compare);
+        for(uint32_t i=1;i<s->reserve_count;i++)
+            if(s->reserves[i-1u].start+s->reserves[i-1u].count>s->reserves[i].start)
+                {rc=IFS_FS_CORRUPT;break;}
+    }
+    if(rc)reservations_drop(s);
+    return rc;
+}
+static const Reservation *reservation_for(const Session *s,uint32_t ino)
+{
+    for(uint32_t i=0;i<s->reserve_count;i++)if(s->reserves[i].target==ino)return &s->reserves[i];
+    return NULL;
+}
+static int reserved_block(const Session *s,uint64_t b)
+{
+    uint32_t lo=0,hi=s->reserve_count;
+    while(lo<hi){
+        uint32_t mid=lo+(hi-lo)/2u;const Reservation *r=&s->reserves[mid];
+        if(b<r->start)hi=mid;
+        else if(b>=(uint64_t)r->start+r->count)lo=mid+1u;
+        else return 1;
+    }
+    return 0;
 }
 static int resolve(const Session *s,const char *path,Inode *ino,Dirent *ent)
 {
@@ -382,7 +515,7 @@ static int mount_impl(const IfsFsHostRuntimeV2 *h,void **v,IfsFsVolumeInfoV2 *o)
     if(journal_supported(h) && g.first==journal_first(h) && jr!=IFS_FS_OK)
         return jr==IFS_FS_NOT_FOUND?IFS_FS_CORRUPT:jr;
     if(writable && (jr || g.first!=journal_first(h)))return IFS_FS_ACCESS;
-    session=(Session){.g=g,.writable=writable,.recovered=recovered};
+    session=(Session){.g=g,.writable=writable,.recovered=recovered,.journal_owned=jr==IFS_FS_OK};
     size_t n=h->structure_bytes<sizeof(session.host)?h->structure_bytes:sizeof(session.host);
     memcpy(&session.host,h,n);session.host.structure_bytes=(uint32_t)n;
     Inode root;Dirent dummy;
@@ -390,8 +523,10 @@ static int mount_impl(const IfsFsHostRuntimeV2 *h,void **v,IfsFsVolumeInfoV2 *o)
     if(!rc)rc=inode_load(&session,ROOT,&root);
     if(!rc && root.type!=IFS_FS_ENTRY_DIRECTORY)rc=IFS_FS_CORRUPT;
     if(!rc){rc=directory_find(&session,&root,NULL,0,UINT32_MAX,&dummy);if(rc==IFS_FS_END)rc=IFS_FS_OK;}
+    if(!rc)rc=reservations_reload(&session);
     if(!rc && writable)rc=check_native(&session);
     if(rc){
+        reservations_drop(&session);
         if(session.bitmap)h->release(h->context,session.bitmap);
         session=(Session){0};return rc;
     }
@@ -401,6 +536,7 @@ static int unmount_impl(void *v)
 {
     if(!v || (uintptr_t)v!=session.token)return IFS_FS_INVALID;
     if(active_plan)return IFS_FS_BUSY;
+    reservations_drop(&session);
     session.host.release(session.host.context,session.bitmap);
     session=(Session){0};return IFS_FS_OK;
 }
@@ -478,7 +614,8 @@ static int allocation_impl(void *v,uint64_t first,IfsFsAllocationRangeV2 *out,
         if(end>session.host.volume_bytes)end=session.host.volume_bytes;
         uint32_t state=IFS_FS_SPACE_RESERVED;
         if(data_block(&session.g,b))
-            state=free_bit(session.bitmap,(uint32_t)b)?IFS_FS_SPACE_FREE:IFS_FS_SPACE_ALLOCATED;
+            state=free_bit(session.bitmap,(uint32_t)b)?IFS_FS_SPACE_FREE:
+                reserved_block(&session,b)?IFS_FS_SPACE_RESERVED:IFS_FS_SPACE_ALLOCATED;
         if(count && page[count-1u].state==state)page[count-1u].length+=end-at;
         else {
             if(count==capacity)break;
@@ -505,11 +642,11 @@ static int flush(const IfsFsHostRuntimeV2 *h)
 {return h->flush(h->context)?IFS_FS_IO_ERROR:IFS_FS_OK;}
 static void set_free(uint8_t *p,uint32_t b)
 {p[b/8u]|=(uint8_t)(1u<<(b%8u));}
-static void make_dir_entry(uint8_t *p,uint32_t slot,uint32_t offset,const char *name,uint32_t n)
+static void make_dir_entry(uint8_t *p,uint32_t slot,uint32_t offset,uint32_t ino,const char *name,uint32_t n)
 {
     p[2]=(uint8_t)(offset/2u);p[3]=(uint8_t)(slot+1u);
     p[4u+slot]=(uint8_t)(offset/2u);
-    put32(p+offset,ROOT);p[offset+4u]=(uint8_t)n;memcpy(p+offset+5u,name,n);
+    put32(p+offset,ino);p[offset+4u]=(uint8_t)n;memcpy(p+offset+5u,name,n);
 }
 /* Format a conventional uniform-cylinder-group EFS partition with a
  * native free bitmap and primary/replica superblocks. Invalidate the
@@ -541,7 +678,7 @@ static int format_impl(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *
     memset(bitmap,0,(size_t)bmblocks*BB);
     for(uint32_t cg=0;cg<groups;++cg)
         for(uint32_t b=first+cg*group+inodes;b<first+(cg+1u)*group;++b)
-            if(b!=root)set_free(bitmap,b);
+            if(b!=root&&b!=root+1u)set_free(bitmap,b);
     uint8_t p[BB]={0},sb[BB]={0};
     int rc=cancelled(h)?IFS_FS_BUSY:write_bytes(h,BB,p,BB);
     if(!rc)rc=flush(h);
@@ -553,26 +690,37 @@ static int format_impl(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *
             memset(p,0,BB);
             if(!cg && !i){
                 uint8_t *inode=p+ROOT*DINODE;
-                put16(inode,0040755u);put16(inode+2,2u);
+                put16(inode,0040755u);put16(inode+2,3u);
                 put32(inode+8,BB);put16(inode+28,1u);
                 inode[33]=(uint8_t)(root>>16);inode[34]=(uint8_t)(root>>8);
                 inode[35]=(uint8_t)root;inode[36]=1u;
+                /* Native directory inode 3 owns real reserve files. */
+                inode+=DINODE;uint32_t reserve=root+1u;
+                put16(inode,0040700u);put16(inode+2,2u);
+                put32(inode+8,BB);put16(inode+28,1u);
+                inode[33]=(uint8_t)(reserve>>16);inode[34]=(uint8_t)(reserve>>8);
+                inode[35]=(uint8_t)reserve;inode[36]=1u;
             }
             rc=write_bytes(h,(uint64_t)(first+cg*group+i)*BB,p,BB);
             if(rc)goto done;
         }
     }
     memset(p,0,BB);put16(p,0xbeefu);
-    make_dir_entry(p,0u,504u,".",1u);
-    make_dir_entry(p,1u,496u,"..",2u);
+    make_dir_entry(p,0u,504u,ROOT,".",1u);
+    make_dir_entry(p,1u,496u,ROOT,"..",2u);
+    make_dir_entry(p,2u,480u,ROOT+1u,RESERVE_DIR,sizeof(RESERVE_DIR)-1u);
     rc=write_bytes(h,(uint64_t)root*BB,p,BB);if(rc)goto done;
+    memset(p,0,BB);put16(p,0xbeefu);
+    make_dir_entry(p,0u,504u,ROOT+1u,".",1u);
+    make_dir_entry(p,1u,496u,ROOT,"..",2u);
+    rc=write_bytes(h,(uint64_t)(root+1u)*BB,p,BB);if(rc)goto done;
     rc=write_bytes(h,2u*BB,bitmap,bmblocks*BB);if(rc)goto done;
     put32(sb,end);put32(sb+4,first);put32(sb+8,group);
     put16(sb+12,inodes);put16(sb+14,63u);put16(sb+16,1u);put16(sb+18,groups);
     put32(sb+28,0x72959u);
     if(label_len){memcpy(sb+32,label,label_len);memcpy(sb+38,label,label_len);}
-    put32(sb+44,bmsize);put32(sb+48,groups*(group-inodes)-1u);
-    put32(sb+52,groups*inodes*4u-3u);
+    put32(sb+44,bmsize);put32(sb+48,groups*(group-inodes)-2u);
+    put32(sb+52,groups*inodes*4u-4u);
     put32(sb+60,total-1u);put32(sb+64,ROOT);
     put32(sb+88,super_checksum(sb,1));
     rc=flush(h);if(rc)goto done;
@@ -730,11 +878,13 @@ static int check_impl(void *v,uint32_t flags,uint64_t *errors)
     if(!errors)return IFS_FS_INVALID;
     *errors=0;
     if(!live(v)||flags)return IFS_FS_INVALID;
-    Session current={.host=session.host};
+    Session current={.host=session.host,.journal_owned=session.journal_owned};
     int rc=geometry(&current.host,&current.g);
     if(!rc && current.g.dirty)rc=IFS_FS_CORRUPT;
     if(!rc)rc=load_bitmap(&current);
+    if(!rc)rc=reservations_reload(&current);
     if(!rc)rc=check_native(&current);
+    reservations_drop(&current);
     if(current.bitmap)current.host.release(current.host.context,current.bitmap);
     if(rc==IFS_FS_CORRUPT){*errors=1u;return IFS_FS_OK;}
     return rc;

@@ -56,15 +56,18 @@ int main(int argc,char **argv){
         assert(be32(sb+28)==p.probe_variant && be16(sb+20)==0);
         uint32_t size=be32(sb),first=be32(sb+4),group=be32(sb+8),groups=be16(sb+18);
         uint32_t inodes=be16(sb+12),rb=first+inodes;
-        assert(size==first+group*groups && be32(sb+48)==groups*(group-inodes)-1);
+        assert(size==first+group*groups && be32(sb+48)==groups*(group-inodes)-2);
         assert(pread(d.fd,replica,512,(off_t)be32(sb+60)*512)==512&&!memcmp(sb,replica,512));
         assert(pread(d.fd,inode,512,(off_t)first*512)==512);
-        assert(be16(inode+256)==0040755u && be16(inode+258)==2 && be32(inode+264)==512);
-        assert(pread(d.fd,root,512,(off_t)rb*512)==512 && be16(root)==0xbeef && root[3]==2);
+        assert(be16(inode+256)==0040755u && be16(inode+258)==3 && be32(inode+264)==512);
+        assert(pread(d.fd,root,512,(off_t)rb*512)==512 && be16(root)==0xbeef && root[3]==3);
         for(unsigned i=0;i<2;i++){
             unsigned off=root[4+i]*2u;assert(be32(root+off)==2 && root[off+4]==i+1);
             assert(root[off+5]=='.');
         }
+        unsigned off=root[6]*2u;
+        assert(be32(root+off)==3&&root[off+4]==11&&!memcmp(root+off+5,".ifs-growth",11));
+        assert(be16(inode+384)==0040700u&&be16(inode+386)==2u);
         h.capabilities=IFS_FS_HOST_READ_ONLY;h.write_at=NULL;h.flush=NULL;
         uint32_t variant=0;void *v=NULL;IfsFsVolumeInfoV2 info={.structure_bytes=sizeof info};
         assert(core->probe(&h,&variant)==0&&variant==p.probe_variant);
@@ -72,6 +75,7 @@ int main(int argc,char **argv){
         uint32_t name_bytes=0;char name[16];assert(vol->label(v,name,sizeof name,&name_bytes)==0&&!strcmp(name,"EFS"));
         IfsFsEntryV2 entry={.structure_bytes=sizeof entry,.name=name,.name_capacity=sizeof name};
         assert(core->directory_entry(v,"/",0,&entry)==IFS_FS_END);
+        assert(core->stat(v,"/.ifs-growth",&entry)==IFS_FS_NOT_FOUND);
         uint64_t at=0,unknown=0,free=0;
         for(;;){
             IfsFsAllocationRangeV2 ranges[4];uint32_t n=0;uint64_t next=at;

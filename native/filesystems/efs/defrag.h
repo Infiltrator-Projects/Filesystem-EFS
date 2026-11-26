@@ -44,12 +44,7 @@ static int inode_crc(const Inode *ino,const Extent *e,uint32_t *crc)
 }
 static int contiguous(const Inode *ino,const Extent *e,uint32_t *start)
 {
-    *start=0;
-    if(!ino->count)return !ino->bytes;
-    *start=e[0].physical;
-    for(uint32_t i=1;i<ino->count;i++)
-        if(e[i-1u].physical+e[i-1u].count!=e[i].physical)return 0;
-    return 1;
+    return physical_run(ino,e,start);
 }
 static int plan_append(DefragPlan *p,uint32_t ino)
 {
@@ -65,6 +60,7 @@ static int plan_append(DefragPlan *p,uint32_t ino)
 static int plan_collect(DefragPlan *p,uint8_t *seen,uint32_t ino,unsigned depth)
 {
     if(depth>256u)return IFS_FS_UNSUPPORTED;
+    if(ino==session.reserve_dir)return IFS_FS_OK;
     if(cancelled(mh()))return IFS_FS_BUSY;
     uint8_t mask=(uint8_t)(1u<<(ino%8u));
     if(seen[ino/8u]&mask)return IFS_FS_OK; /* hard-linked file only once */
@@ -130,6 +126,8 @@ static int simulate_file(uint8_t *bitmap,PlanFile *f)
     int whole=contiguous(&ino,old,&start);
     f->start=start;
     if(!blocks)goto done;
+    /* Ordinary compaction must not destroy an existing growth reserve. */
+    if(reservation_for(&session,ino.ino))goto done;
     rc=choose_run(bitmap,blocks,&dest);
     if(rc==IFS_FS_NO_SPACE && whole){rc=IFS_FS_OK;goto done;}
     if(rc)goto done;

@@ -54,7 +54,9 @@ static int mutation_commit(Mutation *m)
     if(rc){session.fault=1;return rc;}
     memcpy(session.bitmap,m->bitmap,session.g.bitmap_bytes);
     session.g.free_blocks=m->free_blocks;session.g.free_inodes=m->free_inodes;
-    return IFS_FS_OK;
+    rc=reservations_reload(&session);
+    if(rc)session.fault=1;
+    return rc;
 }
 static int mark_allocated(Mutation *m,uint32_t b)
 {
@@ -348,6 +350,8 @@ static int resolve_parent(const char *path,Object *parent,Dirent *leaf)
     memcpy(p,path,plen);p[plen]=0;
     Inode ino;Dirent ent;int rc=resolve(&session,p,&ino,&ent);mem_drop(p);
     if(!rc && ino.type!=IFS_FS_ENTRY_DIRECTORY)rc=IFS_FS_INVALID;
+    if(!rc && ino.ino==ROOT && session.journal_owned && internal_name(leaf->name,leaf->len))
+        rc=IFS_FS_ACCESS;
     return rc?rc:load_object(ino.ino,parent);
 }
 static int change_links(Object *o,int delta)
