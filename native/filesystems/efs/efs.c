@@ -355,6 +355,7 @@ static void volume_info(IfsFsVolumeInfoV2 *o)
        .total_bytes=(uint64_t)session.g.size*BB,
        .free_bytes=(uint64_t)session.g.free_blocks*BB};
 }
+static int check_native(const Session *s);
 static int mount_impl(const IfsFsHostRuntimeV2 *h,void **v,IfsFsVolumeInfoV2 *o)
 {
     if(!v || !o || o->structure_bytes<sizeof *o)return IFS_FS_INVALID;
@@ -387,6 +388,7 @@ static int mount_impl(const IfsFsHostRuntimeV2 *h,void **v,IfsFsVolumeInfoV2 *o)
     if(!rc)rc=inode_load(&session,ROOT,&root);
     if(!rc && root.type!=IFS_FS_ENTRY_DIRECTORY)rc=IFS_FS_CORRUPT;
     if(!rc){rc=directory_find(&session,&root,NULL,0,UINT32_MAX,&dummy);if(rc==IFS_FS_END)rc=IFS_FS_OK;}
+    if(!rc && writable)rc=check_native(&session);
     if(rc){
         if(session.bitmap)h->release(h->context,session.bitmap);
         session=(Session){0};return rc;
@@ -747,6 +749,7 @@ static int stage_super(Tx *t,const uint8_t sb[BB],uint32_t replica)
     if(!rc && replica)rc=tx_stage(t,(uint64_t)replica*BB,sb,BB);
     return rc;
 }
+#include "mutation.h"
 static int set_label_impl(void *v,const char *name)
 {
     if(!live(v)||!name)return IFS_FS_INVALID;
@@ -802,6 +805,11 @@ WRAP(unmount,(void *v),unmount_impl(v))
 WRAP(stat_path,(void *v,const char *p,IfsFsEntryV2 *o),stat_impl(v,p,o))
 WRAP(list_path,(void *v,const char *p,uint32_t i,IfsFsEntryV2 *o),list_impl(v,p,i,o))
 WRAP(read_path,(void *v,const char *p,uint64_t at,void *b,uint32_t n),read_impl(v,p,at,b,n))
+WRAP(write_path,(void *v,const char *p,uint64_t at,const void *b,uint32_t n),write_impl(v,p,at,b,n))
+WRAP(create_path,(void *v,const char *p,uint32_t type),create_impl(v,p,type))
+WRAP(remove_path,(void *v,const char *p),remove_impl(v,p))
+WRAP(rename_path,(void *v,const char *p,const char *q),rename_impl(v,p,q))
+WRAP(truncate_path,(void *v,const char *p,uint64_t n),truncate_impl(v,p,n))
 WRAP(query_volume,(void *v,IfsFsVolumeInfoV2 *o),query_impl(v,o))
 WRAP(check,(void *v,uint32_t flags,uint64_t *errors),check_impl(v,flags,errors))
 WRAP(label,(void *v,char *p,uint32_t c,uint32_t *n),label_impl(v,p,c,n))
@@ -817,8 +825,9 @@ static int map_path(void *v,const char *p,uint64_t first,IfsFsExtentV2 *out,uint
 }
 static const IfsFsCoreOpsV2 core={
     .header={IFS_FS_GROUP_ABI_V2,sizeof core,IFS_FS_GROUP_CORE,0,
-        IFS_FS_CORE_PROBE|IFS_FS_CORE_MOUNT|IFS_FS_CORE_STAT|IFS_FS_CORE_LIST|IFS_FS_CORE_READ},
-    .probe=probe,.mount=mount,.unmount=unmount,.stat=stat_path,.directory_entry=list_path,.read=read_path};
+        IFS_FS_CORE_ALL},
+    .probe=probe,.mount=mount,.unmount=unmount,.stat=stat_path,.directory_entry=list_path,.read=read_path,
+    .write=write_path,.create=create_path,.remove=remove_path,.rename=rename_path,.truncate=truncate_path};
 static const IfsFsVolumeOpsV2 volume={
     .header={IFS_FS_GROUP_ABI_V2,sizeof volume,IFS_FS_GROUP_VOLUME,0,
         IFS_FS_VOLUME_QUERY|IFS_FS_VOLUME_LABEL_GET|IFS_FS_VOLUME_FORMAT|IFS_FS_VOLUME_CHECK|
