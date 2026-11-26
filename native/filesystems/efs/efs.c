@@ -33,7 +33,8 @@ typedef struct {
     uint64_t recovered;
 } Session;
 static Session session;
-static uintptr_t generation;
+static uintptr_t generation,active_plan;
+static int plan_executing;
 static atomic_flag gate=ATOMIC_FLAG_INIT;
 static int enter(void){return !atomic_flag_test_and_set_explicit(&gate,memory_order_acquire);}
 static int leave(int rc){atomic_flag_clear_explicit(&gate,memory_order_release);return rc;}
@@ -399,6 +400,7 @@ static int mount_impl(const IfsFsHostRuntimeV2 *h,void **v,IfsFsVolumeInfoV2 *o)
 static int unmount_impl(void *v)
 {
     if(!v || (uintptr_t)v!=session.token)return IFS_FS_INVALID;
+    if(active_plan)return IFS_FS_BUSY;
     session.host.release(session.host.context,session.bitmap);
     session=(Session){0};return IFS_FS_OK;
 }
@@ -751,10 +753,12 @@ static int stage_super(Tx *t,const uint8_t sb[BB],uint32_t replica)
     return rc;
 }
 #include "mutation.h"
+#include "defrag.h"
 static int set_label_impl(void *v,const char *name)
 {
     if(!live(v)||!name)return IFS_FS_INVALID;
     if(!session.writable)return IFS_FS_ACCESS;
+    if(active_plan)return IFS_FS_BUSY;
     uint32_t n=0;
     while(n<7u && name[n]){
         unsigned char c=(unsigned char)name[n];
@@ -817,6 +821,11 @@ WRAP(label,(void *v,char *p,uint32_t c,uint32_t *n),label_impl(v,p,c,n))
 WRAP(set_label,(void *v,const char *name),set_label_impl(v,name))
 WRAP(sync_volume,(void *v),sync_impl(v))
 WRAP(recover,(void *v,uint32_t flags,uint64_t *n),recover_impl(v,flags,n))
+WRAP(plan,(void *v,const char *p,uint32_t policy,void **o),plan_impl(v,p,policy,o))
+WRAP(execute,(void *v,void *p,uint64_t *n),execute_impl(v,p,n))
+WRAP(verify,(void *v,void *p),verify_impl(v,p))
+static void release_plan(void *v,void *p)
+{if(enter()){release_impl(v,p);(void)leave(IFS_FS_OK);}}
 WRAP(format,(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *name,uint32_t flags),format_impl(h,variant,name,flags))
 static int map_path(void *v,const char *p,uint64_t first,IfsFsExtentV2 *out,uint32_t c,uint32_t *n)
 {
@@ -841,8 +850,8 @@ static const IfsFsFormatProfileOpsV2 profile={
     .header={IFS_FS_GROUP_ABI_V2,sizeof profile,IFS_FS_GROUP_FORMAT_PROFILE,0,IFS_FS_FORMAT_PROFILE_DEFAULT},
     .get_default=format_profile};
 static const IfsFsDefragOpsV2 defrag={
-    .header={IFS_FS_GROUP_ABI_V2,sizeof defrag,IFS_FS_GROUP_DEFRAG,0,IFS_FS_DEFRAG_MAP|IFS_FS_DEFRAG_RECOVER},
-    .map=map_path,.recover=recover};
+    .header={IFS_FS_GROUP_ABI_V2,sizeof defrag,IFS_FS_GROUP_DEFRAG,0,IFS_FS_DEFRAG_ALL},
+    .map=map_path,.plan=plan,.execute=execute,.verify=verify,.recover=recover,.release_plan=release_plan};
 static const IfsFsGroupHeaderV2 *group(uint32_t id,uint32_t lo,uint32_t hi)
 {
     if(lo>2u||hi<2u)return NULL;

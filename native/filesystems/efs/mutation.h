@@ -23,6 +23,7 @@ static int mutation_begin(Mutation *m,void *v)
     *m=(Mutation){0};
     if(!live(v))return IFS_FS_INVALID;
     if(!session.writable)return IFS_FS_ACCESS;
+    if(active_plan && !plan_executing)return IFS_FS_BUSY;
     if(cancelled(mh()))return IFS_FS_BUSY;
     int rc=tx_begin(&m->tx,mh());if(rc)return rc;
     m->bitmap=mem_new(session.g.bitmap_bytes);
