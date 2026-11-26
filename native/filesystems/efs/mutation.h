@@ -436,6 +436,96 @@ static int reservation_delete(Mutation *m,uint32_t target,int release_data)
 done:
     mem_drop(old);names_drop(&names);return rc;
 }
+/* A reserve is a native allocated owner, not free space. Transfer its
+ * blocks to the target in the same transaction as the new inode sizes.
+ * Keep all existing user payload sectors journal-protected. A whole
+ * physical page entirely inside the reserve may receive new payload
+ * before PREPARED: it has no prior user-visible file contents. */
+static int write_growth_block(Mutation *m,const Reservation *r,uint32_t block,const uint8_t p[BB])
+{
+    uint32_t page=block/(JUNIT/BB),first=page*(JUNIT/BB);
+    int private_page=first>=r->start && first+JUNIT/BB<=r->start+r->count;
+    for(uint32_t i=0;i<m->tx.count;i++)if(m->tx.page[i]==page)private_page=0;
+    if(!private_page)return tx_stage(&m->tx,(uint64_t)block*BB,p,BB);
+    uint8_t full[JUNIT];
+    int rc=jread(mh(),(uint64_t)page*JUNIT,full);if(rc)return rc;
+    memcpy(full+(block-first)*BB,p,BB);
+    return jwrite(mh(),(uint64_t)page*JUNIT,full);
+}
+static int shrink_reservation(Mutation *m,const Reservation *r,uint32_t used)
+{
+    if(!used)return IFS_FS_OK;
+    if(used>r->count)return IFS_FS_CORRUPT;
+    if(used==r->count)return reservation_delete(m,r->target,0);
+    Object owner;int rc=reservation_owner(r,&owner);if(rc)return rc;
+    Runs runs={0};
+    rc=exact_runs(m,r->start+used,r->count-used,0,&runs);
+    if(!rc)rc=build_descriptors(m,&owner,&runs);
+    if(!rc)rc=release_tables(m,&owner.old);
+    if(!rc){
+        put32(owner.raw+8,(r->count-used)*BB);stamp(owner.raw,0);
+        rc=stage_inode(m,owner.old.ino,owner.raw);
+    }
+    runs_drop(&runs);return rc;
+}
+static int can_use_reservation(const Object *o,const Reservation *r,uint32_t bytes,
+                               uint32_t at,uint32_t n)
+{
+    if(!r||bytes<o->old.bytes)return 0;
+    uint32_t old_blocks=(o->old.bytes+BB-1u)/BB,new_blocks=(bytes+BB-1u)/BB;
+    if(new_blocks-old_blocks>r->count)return 0;
+    /* Existing user data must be in the bounded redo journal. Large
+     * overwrites use the ordinary atomic COW path rather than splitting
+     * an API write into partly committed transactions. */
+    if(n&&at<o->old.bytes){
+        uint32_t affected=o->old.bytes-at;if(affected>n)affected=n;
+        if(affected>(JMAX-12u)*JUNIT)return 0;
+    }
+    return 1;
+}
+static int use_reservation(Mutation *m,Object *o,const Reservation *r,
+                           uint32_t bytes,uint32_t at,const void *data,uint32_t n)
+{
+    uint32_t old_blocks=(o->old.bytes+BB-1u)/BB,new_blocks=(bytes+BB-1u)/BB;
+    uint32_t used=new_blocks-old_blocks,start=0;
+    Extent *old=NULL;int rc=extents(&session,&o->old,&old);if(rc)return rc;
+    Runs target={0};
+    if(!physical_run(&o->old,old,&start)||start+old_blocks!=r->start||used>r->count){
+        rc=IFS_FS_CORRUPT;goto done;
+    }
+    if(used){
+        rc=exact_runs(m,start,new_blocks,0,&target);if(rc)goto done;
+        rc=build_descriptors(m,o,&target);if(rc)goto done;
+        rc=release_tables(m,&o->old);if(rc)goto done;
+    }
+    uint32_t first=n?at/BB:o->old.bytes/BB;
+    uint32_t end=n?(at+n+BB-1u)/BB:0u;
+    if(bytes>o->old.bytes){
+        uint32_t old_end=o->old.bytes/BB;
+        if(first>old_end)first=old_end;
+        if(end<new_blocks)end=new_blocks;
+    }
+    FileSource source={.old=&o->old,.ext=old,.bytes=bytes,.at=at,.length=n,.data=data};
+    for(uint32_t logical=first;logical<end;logical++){
+        if(cancelled(mh())){rc=IFS_FS_BUSY;goto done;}
+        uint8_t p[BB]={0};rc=file_source(&source,logical,p);if(rc)goto done;
+        rc=write_growth_block(m,r,start+logical,p);if(rc)goto done;
+    }
+    put32(o->raw+8,bytes);stamp(o->raw,0);
+    rc=stage_inode(m,o->old.ino,o->raw);
+    if(!rc)rc=shrink_reservation(m,r,used);
+done:
+    runs_drop(&target);mem_drop(old);return rc;
+}
+static int rewrite_with_reservation(Mutation *m,Object *o,uint32_t bytes,
+                                    uint32_t at,const void *p,uint32_t n)
+{
+    const Reservation *r=reservation_for(&session,o->old.ino);
+    if(can_use_reservation(o,r,bytes,at,n))
+        return use_reservation(m,o,r,bytes,at,p,n);
+    int rc=reservation_delete(m,o->old.ino,1);
+    return rc?rc:replace_file(m,o,bytes,at,p,n);
+}
 static int resolve_parent(const char *path,Object *parent,Dirent *leaf)
 {
     if(!path||path[0]!='/')return IFS_FS_INVALID;
@@ -493,8 +583,7 @@ static int write_impl(void *v,const char *path,uint64_t at,const void *p,uint32_
     if(!rc && n){
         rc=load_object(ino.ino,&o);
         uint32_t bytes=ino.bytes>at+n?ino.bytes:(uint32_t)(at+n);
-        if(!rc)rc=reservation_delete(&m,ino.ino,1);
-        if(!rc)rc=replace_file(&m,&o,bytes,(uint32_t)at,p,n);
+        if(!rc)rc=rewrite_with_reservation(&m,&o,bytes,(uint32_t)at,p,n);
         if(!rc)rc=mutation_commit(&m);
     }
     mutation_end(&m);return rc;
@@ -508,8 +597,7 @@ static int truncate_impl(void *v,const char *path,uint64_t bytes)
     if(!rc && ino.type!=IFS_FS_ENTRY_FILE)rc=IFS_FS_UNSUPPORTED;
     if(!rc && bytes!=ino.bytes){
         rc=load_object(ino.ino,&o);
-        if(!rc)rc=reservation_delete(&m,ino.ino,1);
-        if(!rc)rc=replace_file(&m,&o,(uint32_t)bytes,0,NULL,0);
+        if(!rc)rc=rewrite_with_reservation(&m,&o,(uint32_t)bytes,0,NULL,0);
         if(!rc)rc=mutation_commit(&m);
     }
     mutation_end(&m);return rc;

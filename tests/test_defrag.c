@@ -69,7 +69,7 @@ int main(int argc,char **argv){
     const IfsFsDefragOpsV2 *m=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_DEFRAG);
     const IfsFsAllocationOpsV2 *a=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_ALLOCATION);
     assert(m->header.capabilities==IFS_FS_DEFRAG_ALL&&a&&a->map);
-    uint8_t payload[PAYLOAD],readback[PAYLOAD],guard[GUARD];
+    uint8_t payload[PAYLOAD],readback[PAYLOAD+GUARD*2],guard[GUARD];
     for(unsigned i=0;i<PAYLOAD;i++)payload[i]=(uint8_t)(i*19u+i/251u);
     char path[]="/tmp/efs-defrag-XXXXXX";Disk d={.fd=mkstemp(path)};
     assert(d.fd>=0&&unlink(path)==0&&ftruncate(d.fd,SIZE)==0);
@@ -112,8 +112,8 @@ int main(int argc,char **argv){
         h=host(&d,0);assert(c->mount(&h,&volume,&info)==0);
         assert(extents(m,volume,"/fragmented",&now)==1);
         if(policy)prove_reserve(&d,a,volume,now.physical_offset+PAYLOAD,reserve_bytes);
-        assert(c->read(volume,"/fragmented",0,readback,sizeof readback)==0&&!memcmp(payload,readback,sizeof payload));
-        assert(pread(d.fd,readback,sizeof readback,(off_t)now.physical_offset)==sizeof readback);
+        assert(c->read(volume,"/fragmented",0,readback,PAYLOAD)==0&&!memcmp(payload,readback,sizeof payload));
+        assert(pread(d.fd,readback,PAYLOAD,(off_t)now.physical_offset)==PAYLOAD);
         assert(!memcmp(payload,readback,sizeof payload));
         for(unsigned i=1;i<16;i+=2){
             snprintf(name,sizeof name,"/block%02u",i);
@@ -137,6 +137,41 @@ int main(int argc,char **argv){
                 assert(extents(m,volume,name,&now)==1);
                 prove_reserve(&d,a,volume,now.physical_offset+GUARD,((GUARD/512+9u)/10u)*512u);
             }
+            /* Append consumes native reserved blocks without moving the
+             * original payload. A small overwrite preserves the reserve. */
+            assert(extents(m,volume,"/fragmented",&now)==1);
+            uint64_t start=now.physical_offset;
+            uint8_t addition[1025];memset(addition,0x5e,sizeof addition);
+            assert(c->write(volume,"/fragmented",PAYLOAD,addition,sizeof addition)==0);
+            assert(extents(m,volume,"/fragmented",&now)==1&&now.physical_offset==start&&now.length==PAYLOAD+sizeof addition);
+            prove_reserve(&d,a,volume,start+PAYLOAD+1536,reserve_bytes-1536);
+            uint8_t marker=0xa7;
+            assert(c->write(volume,"/fragmented",17,&marker,1)==0);
+            prove_reserve(&d,a,volume,start+PAYLOAD+1536,reserve_bytes-1536);
+            assert(c->read(volume,"/fragmented",0,readback,PAYLOAD+sizeof addition)==0);
+            assert(readback[17]==marker);readback[17]=payload[17];
+            assert(!memcmp(readback,payload,PAYLOAD)&&!memcmp(readback+PAYLOAD,addition,sizeof addition));
+            /* Replenish a partially consumed reservation, then grow to
+             * use every newly reserved block; no orphan owner may remain. */
+            assert(m->plan(volume,"/fragmented",10,&plan)==0);
+            assert(m->execute(volume,plan,&moved)==0&&m->verify(volume,plan)==0);
+            m->release_plan(volume,plan);
+            assert(extents(m,volume,"/fragmented",&now)==1);
+            start=now.physical_offset;
+            uint64_t allocated=(PAYLOAD+sizeof addition+511u)/512u*512u;
+            uint64_t fresh=((allocated/512u+9u)/10u)*512u;
+            prove_reserve(&d,a,volume,start+allocated,fresh);
+            assert(c->truncate(volume,"/fragmented",allocated+fresh)==0);
+            assert(extents(m,volume,"/fragmented",&now)==1&&now.physical_offset==start&&now.length==allocated+fresh);
+            IfsFsAllocationRangeV2 range;uint32_t nr=0;
+            assert(a->map(volume,start+allocated,&range,1,&nr)==0&&nr==1&&range.state==IFS_FS_SPACE_ALLOCATED);
+            assert(c->read(volume,"/fragmented",0,readback,(uint32_t)(allocated+fresh))==0);
+            assert(readback[17]==marker);readback[17]=payload[17];
+            assert(!memcmp(readback,payload,PAYLOAD)&&!memcmp(readback+PAYLOAD,addition,sizeof addition));
+            for(uint64_t i=PAYLOAD+sizeof addition;i<allocated+fresh;i++)assert(!readback[i]);
+            assert(v->check(volume,0,&errors)==0&&!errors);
+            assert(c->unmount(volume)==0);h=host(&d,1);assert(c->mount(&h,&volume,&info)==0);
+            assert(extents(m,volume,"/fragmented",&now)==1&&now.physical_offset==start&&now.length==allocated+fresh);
             assert(c->remove(volume,"/fragmented")==0);
             assert(v->check(volume,0,&errors)==0&&!errors);
             assert(c->unmount(volume)==0);
