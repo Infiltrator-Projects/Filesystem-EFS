@@ -17,3 +17,5 @@ Source operations, actual runtime masks and exact qualification evidence govern 
 The independent interoperability workflow uses a hash-pinned Rusty Backup CLI release solely as a test oracle: foreign formatted media are read through Common V2, and provider formatted media are independently checked and extracted. No oracle binary or invocation is part of production code or installation.
 
 Streaming extension preserves existing extents and publishes only the new allocation, indirect extent tables, inode size and any partial EOF block through the redo transaction. Larger native cylinder groups permit the full-sized heterogeneous consumer corpus to relocate files larger than 32 MiB.
+
+The release gate also builds the actual Defragmenter consumer at its pinned provider-profile revision and tests the extracted candidate package with the full production corpus, standard and growth relocation, independent payload/physical allocation verification and cold recovery. It does not introduce any EFS-specific consumer implementation.
