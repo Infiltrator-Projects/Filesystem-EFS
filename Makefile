@@ -5,7 +5,7 @@ CFLAGS ?= -O2
 BASE = -std=c11 -Wall -Wextra -Werror -I$(COMMON)/include
 .PHONY: all check clean
 all: build/EFS.so
-build/EFS.so: native/filesystems/efs/efs.c
+build/EFS.so: native/filesystems/efs/efs.c native/filesystems/efs/journal.h
 	mkdir -p build
 	$(CC) $(BASE) $(CFLAGS) -fPIC -fvisibility=hidden -shared -Wl,-z,defs -o $@ $<
 build/test_efs: tests/test_efs.c
@@ -14,9 +14,13 @@ build/test_efs: tests/test_efs.c
 build/test_format: tests/test_format.c
 	mkdir -p build
 	$(CC) $(BASE) $(CFLAGS) -o $@ $< -ldl
-check: all build/test_efs build/test_format
+build/test_journal: tests/test_journal.c
+	mkdir -p build
+	$(CC) $(BASE) $(CFLAGS) -o $@ $< -ldl
+check: all build/test_efs build/test_format build/test_journal
 	test "$$(nm -D --defined-only build/EFS.so | awk '{print $$3}')" = infiltrator_filesystem_api_v2
 	build/test_efs ./build/EFS.so
 	build/test_format ./build/EFS.so
+	build/test_journal ./build/EFS.so
 clean:
 	rm -rf build

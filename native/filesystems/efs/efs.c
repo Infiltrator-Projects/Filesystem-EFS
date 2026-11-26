@@ -29,13 +29,15 @@ typedef struct {
     Geometry g;
     uint8_t *bitmap;
     uintptr_t token;
+    int writable,fault;
+    uint64_t recovered;
 } Session;
 static Session session;
 static uintptr_t generation;
 static atomic_flag gate=ATOMIC_FLAG_INIT;
 static int enter(void){return !atomic_flag_test_and_set_explicit(&gate,memory_order_acquire);}
 static int leave(int rc){atomic_flag_clear_explicit(&gate,memory_order_release);return rc;}
-static int live(void *v){return v && (uintptr_t)v==session.token;}
+static int live(void *v){return v && (uintptr_t)v==session.token && !session.fault;}
 static uint32_t be16(const uint8_t *p){return ((uint32_t)p[0]<<8)|p[1];}
 static uint32_t be24(const uint8_t *p){return (be16(p)<<8)|p[2];}
 static uint32_t be32(const uint8_t *p){return (be16(p)<<16)|be16(p+2);}
@@ -88,6 +90,7 @@ static int geometry(const IfsFsHostRuntimeV2 *h,Geometry *g)
         return IFS_FS_CORRUPT;
     return IFS_FS_OK;
 }
+#include "journal.h"
 static int probe(const IfsFsHostRuntimeV2 *h,uint32_t *variant)
 {
     if(!variant)return IFS_FS_INVALID;
@@ -357,11 +360,26 @@ static int mount_impl(const IfsFsHostRuntimeV2 *h,void **v,IfsFsVolumeInfoV2 *o)
     if(!v || !o || o->structure_bytes<sizeof *o)return IFS_FS_INVALID;
     *v=NULL;
     if(!ifs_fs_host_v2_valid(h))return IFS_FS_INVALID;
-    if(!(h->capabilities&IFS_FS_HOST_READ_ONLY))return IFS_FS_ACCESS;
     if(session.token || generation==UINTPTR_MAX)return IFS_FS_BUSY;
-    Geometry g;int rc=geometry(h,&g);if(rc)return rc;
+    const int writable=!(h->capabilities&IFS_FS_HOST_READ_ONLY);
+    Geometry g;int rc=geometry(h,&g);
+    uint64_t recovered=0;
+    /* Foreign EFS remains readable, but mutation requires a journal that
+     * was installed by this provider's native format. A torn primary may
+     * be replayed only from a validated prepared journal on a writable host. */
+    Journal j;int jr=IFS_FS_NOT_FOUND;
+    if(journal_supported(h) && (rc || g.first==journal_first(h)))
+        jr=journal_load(h,&j);
+    if(!jr && j.count){
+        if(!writable)return IFS_FS_BUSY;
+        int rr=journal_replay(h,&j);if(rr)return rr;
+        recovered=1;rc=geometry(h,&g);
+    }
+    if(rc)return rc;
     if(g.dirty)return IFS_FS_UNSUPPORTED;
-    session=(Session){.g=g};
+    if(g.first==journal_first(h) && jr!=IFS_FS_OK && jr!=IFS_FS_NOT_FOUND)return jr;
+    if(writable && (jr || g.first!=journal_first(h)))return IFS_FS_ACCESS;
+    session=(Session){.g=g,.writable=writable,.recovered=recovered};
     size_t n=h->structure_bytes<sizeof(session.host)?h->structure_bytes:sizeof(session.host);
     memcpy(&session.host,h,n);session.host.structure_bytes=(uint32_t)n;
     Inode root;Dirent dummy;
@@ -377,7 +395,7 @@ static int mount_impl(const IfsFsHostRuntimeV2 *h,void **v,IfsFsVolumeInfoV2 *o)
 }
 static int unmount_impl(void *v)
 {
-    if(!live(v))return IFS_FS_INVALID;
+    if(!v || (uintptr_t)v!=session.token)return IFS_FS_INVALID;
     session.host.release(session.host.context,session.bitmap);
     session=(Session){0};return IFS_FS_OK;
 }
@@ -499,8 +517,7 @@ static int format_impl(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *
     if(h->capabilities&IFS_FS_HOST_READ_ONLY)return IFS_FS_ACCESS;
     if(session.token)return IFS_FS_BUSY;
     if(variant!=0x72959u || flags || h->volume_bytes<FORMAT_MIN ||
-       h->volume_bytes>FORMAT_MAX || h->volume_bytes%h->logical_sector_bytes ||
-       h->logical_sector_bytes>4096u)return IFS_FS_UNSUPPORTED;
+       h->volume_bytes>FORMAT_MAX || !journal_supported(h))return IFS_FS_UNSUPPORTED;
     uint32_t label_len=0;
     if(label)while(label_len<7u && label[label_len]){
         unsigned char c=(unsigned char)label[label_len];
@@ -509,7 +526,7 @@ static int format_impl(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *
     }
     if(label_len>6u)return IFS_FS_INVALID;
     uint32_t total=(uint32_t)(h->volume_bytes/BB),bmsize=(total+7u)/8u;
-    uint32_t bmblocks=(bmsize+511u)/BB,first=2u+bmblocks;
+    uint32_t bmblocks=(bmsize+511u)/BB,first=journal_first(h);
     uint32_t usable=total-first-1u,groups=(usable+65535u)/65536u;
     uint32_t group=usable/groups,inodes=group/32u;
     if(!inodes)inodes=1u;
@@ -524,6 +541,7 @@ static int format_impl(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *
     int rc=cancelled(h)?IFS_FS_BUSY:write_bytes(h,BB,p,BB);
     if(!rc)rc=flush(h);
     if(rc)goto done;
+    rc=journal_init(h);if(rc)goto done;
     for(uint32_t cg=0;cg<groups;++cg){
         for(uint32_t i=0;i<inodes;++i){
             if(cancelled(h)){rc=IFS_FS_BUSY;goto done;}
@@ -721,6 +739,54 @@ static int query_impl(void *v,IfsFsVolumeInfoV2 *o)
     if(!live(v)||!o||o->structure_bytes<sizeof *o)return IFS_FS_INVALID;
     volume_info(o);return IFS_FS_OK;
 }
+/* All future writable namespace changes must stage the native superblock,
+ * replica and metadata in this same transaction before committing. */
+static int stage_super(Tx *t,const uint8_t sb[BB],uint32_t replica)
+{
+    int rc=tx_stage(t,BB,sb,BB);
+    if(!rc && replica)rc=tx_stage(t,(uint64_t)replica*BB,sb,BB);
+    return rc;
+}
+static int set_label_impl(void *v,const char *name)
+{
+    if(!live(v)||!name)return IFS_FS_INVALID;
+    if(!session.writable)return IFS_FS_ACCESS;
+    uint32_t n=0;
+    while(n<7u && name[n]){
+        unsigned char c=(unsigned char)name[n];
+        if(c<32u||c>126u)return IFS_FS_INVALID;
+        ++n;
+    }
+    if(n>6u)return IFS_FS_INVALID;
+    if(cancelled(&session.host))return IFS_FS_BUSY;
+    uint8_t sb[BB];int rc=read_bytes(&session.host,BB,sb,BB);if(rc)return rc;
+    memset(sb+32,0,12);memcpy(sb+32,name,n);memcpy(sb+38,name,n);
+    put32(sb+88,super_checksum(sb,1));
+    Tx t;rc=tx_begin(&t,&session.host);if(rc)return rc;
+    rc=stage_super(&t,sb,session.g.replica);
+    if(!rc && cancelled(&session.host))rc=IFS_FS_BUSY;
+    if(!rc){
+        rc=tx_commit(&t);
+        if(rc)session.fault=1;
+    }
+    tx_end(&t);
+    if(!rc)memcpy(session.g.label,sb+32,6);
+    return rc;
+}
+static int sync_impl(void *v)
+{
+    if(!live(v))return IFS_FS_INVALID;
+    return session.writable?jflush(&session.host):IFS_FS_OK;
+}
+static int recover_impl(void *v,uint32_t flags,uint64_t *repaired)
+{
+    if(!repaired)return IFS_FS_INVALID;
+    *repaired=0;
+    if(!live(v)||flags)return IFS_FS_INVALID;
+    if(!session.writable)return IFS_FS_ACCESS;
+    *repaired=session.recovered;session.recovered=0;
+    return IFS_FS_OK;
+}
 static int label_impl(void *v,char *p,uint32_t cap,uint32_t *n)
 {
     if(!n)return IFS_FS_INVALID;
@@ -739,6 +805,9 @@ WRAP(read_path,(void *v,const char *p,uint64_t at,void *b,uint32_t n),read_impl(
 WRAP(query_volume,(void *v,IfsFsVolumeInfoV2 *o),query_impl(v,o))
 WRAP(check,(void *v,uint32_t flags,uint64_t *errors),check_impl(v,flags,errors))
 WRAP(label,(void *v,char *p,uint32_t c,uint32_t *n),label_impl(v,p,c,n))
+WRAP(set_label,(void *v,const char *name),set_label_impl(v,name))
+WRAP(sync_volume,(void *v),sync_impl(v))
+WRAP(recover,(void *v,uint32_t flags,uint64_t *n),recover_impl(v,flags,n))
 WRAP(format,(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *name,uint32_t flags),format_impl(h,variant,name,flags))
 static int map_path(void *v,const char *p,uint64_t first,IfsFsExtentV2 *out,uint32_t c,uint32_t *n)
 {
@@ -752,8 +821,9 @@ static const IfsFsCoreOpsV2 core={
     .probe=probe,.mount=mount,.unmount=unmount,.stat=stat_path,.directory_entry=list_path,.read=read_path};
 static const IfsFsVolumeOpsV2 volume={
     .header={IFS_FS_GROUP_ABI_V2,sizeof volume,IFS_FS_GROUP_VOLUME,0,
-        IFS_FS_VOLUME_QUERY|IFS_FS_VOLUME_LABEL_GET|IFS_FS_VOLUME_FORMAT|IFS_FS_VOLUME_CHECK},
-    .query=query_volume,.label=label,.format=format,.check=check};
+        IFS_FS_VOLUME_QUERY|IFS_FS_VOLUME_LABEL_GET|IFS_FS_VOLUME_FORMAT|IFS_FS_VOLUME_CHECK|
+        IFS_FS_VOLUME_LABEL_SET|IFS_FS_VOLUME_SYNC},
+    .query=query_volume,.label=label,.format=format,.check=check,.set_label=set_label,.sync=sync_volume};
 static const IfsFsAllocationOpsV2 allocation={
     .header={IFS_FS_GROUP_ABI_V2,sizeof allocation,IFS_FS_GROUP_ALLOCATION,0,IFS_FS_ALLOCATION_MAP},
     .map=allocation_map};
@@ -761,8 +831,8 @@ static const IfsFsFormatProfileOpsV2 profile={
     .header={IFS_FS_GROUP_ABI_V2,sizeof profile,IFS_FS_GROUP_FORMAT_PROFILE,0,IFS_FS_FORMAT_PROFILE_DEFAULT},
     .get_default=format_profile};
 static const IfsFsDefragOpsV2 defrag={
-    .header={IFS_FS_GROUP_ABI_V2,sizeof defrag,IFS_FS_GROUP_DEFRAG,0,IFS_FS_DEFRAG_MAP},
-    .map=map_path};
+    .header={IFS_FS_GROUP_ABI_V2,sizeof defrag,IFS_FS_GROUP_DEFRAG,0,IFS_FS_DEFRAG_MAP|IFS_FS_DEFRAG_RECOVER},
+    .map=map_path,.recover=recover};
 static const IfsFsGroupHeaderV2 *group(uint32_t id,uint32_t lo,uint32_t hi)
 {
     if(lo>2u||hi<2u)return NULL;

@@ -77,7 +77,7 @@ int main(int argc,char **argv){
     const IfsFsCoreOpsV2 *c=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_CORE);
     const IfsFsVolumeOpsV2 *vol=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_VOLUME);
     const IfsFsDefragOpsV2 *m=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_DEFRAG);
-    assert(c && vol && m && m->header.capabilities==IFS_FS_DEFRAG_MAP);
+    assert(c && vol && m && m->header.capabilities==(IFS_FS_DEFRAG_MAP|IFS_FS_DEFRAG_RECOVER));
     assert(!c->write && !c->create && vol->format && !m->execute);
     const IfsFsAllocationOpsV2 *a=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_ALLOCATION);
     assert(a && a->header.capabilities==IFS_FS_ALLOCATION_MAP && a->map);
