@@ -1,0 +1,22 @@
+name: Native EFS Common V2 development qualification
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Retrieve exact canonical Common V2 source
+        run: |
+          git clone https://github.com/Infiltrator-Projects/Libraries.git Libraries
+          git -C Libraries checkout 225e640ebed5351b1481bfbeef1a6144ca5146e7
+      - name: Compile and test the actual shared object
+        run: make check
+      - name: Address and undefined behaviour sanitizers
+        run: |
+          make clean
+          make CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" check

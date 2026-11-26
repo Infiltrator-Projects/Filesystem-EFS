@@ -2,7 +2,7 @@
 
 ## 1. Purpose and format scope
 
-Silicon Graphics Extent File System (EFS). This repository is the designated independent implementation home for InfiltratorOS. **Documentation and migration scaffold only: no independent runtime provider or release is present.**
+Silicon Graphics Extent File System (EFS). This repository is the designated independent implementation home for InfiltratorOS. **Native Common V2 reader under development; no release or full qualification is claimed.**
 
 ## 2. On-disk architecture and invariants
 
@@ -10,7 +10,7 @@ Superblock geometry, inode records, direct and indirect extents, directory entri
 
 ## 3. Common V2 implementation and capabilities
 
-No local Common V2 implementation or advertised operation set has yet been qualified. The target entry point is `infiltrator_filesystem_api_v2`, using bounded, partition-relative host I/O. Implement native probe first, then mount, stat, enumeration, read and volume query where applicable. Consumers must negotiate supported groups and profiles; an unsupported operation must not report success or delegate to a private driver.
+Native CORE probe, read-only mount/unmount, stat, enumeration and read; VOLUME query/label and DEFRAG extent mapping are implemented for development qualification. Full foreign-media, allocation and mutation qualification remains outstanding. The target entry point is `infiltrator_filesystem_api_v2`, using bounded, partition-relative host I/O. Implement native probe first, then mount, stat, enumeration, read and volume query where applicable. Consumers must negotiate supported groups and profiles; an unsupported operation must not report success or delegate to a private driver.
 
 ## 4. Integrity, mutation, allocation and recovery
 
@@ -18,11 +18,11 @@ Mutation, formatting, check/repair and DEFRAG map/plan/execute/verify/recover re
 
 ## 5. Build, installation and release
 
-The target installation is `/System/Filesystems/EFS.so` and `/System/Resources/Documentation/Filesystem-EFS.pdf`. Neither file is currently distributed by this repository. Once the implementation qualifies, the intended release is a portable amd64 DEB and CPU-native source-first RUN, with GitHub's automatic source archive. No install or build command is advertised before an executable build exists.
+The target installation is `/System/Filesystems/EFS.so` and `/System/Resources/Documentation/Filesystem-EFS.pdf`. Neither file is currently distributed by this repository. Once the implementation qualifies, the intended release is a portable amd64 DEB and CPU-native source-first RUN, with GitHub's automatic source archive. For development only, clone Libraries at 225e640ebed5351b1481bfbeef1a6144ca5146e7 into Libraries and run `make check`. Do not deploy this development provider.
 
 ## 6. Qualification and limitations
 
-Independent EFS images, malformed extents and out-of-range inode references. Compare independent payloads and unchanged-image hashes; inject truncation, corruption and I/O faults. Establish exact-revision ABI, hosted and import-free freestanding qualification, then independently test BOOT and kernel integration. No local build, runtime or packaging qualification is claimed.
+Independent EFS images, malformed extents and out-of-range inode references. Compare independent payloads and unchanged-image hashes; inject truncation, corruption and I/O faults. Establish exact-revision ABI, hosted and import-free freestanding qualification, then independently test BOOT and kernel integration. CI exercises the actual shared object against native structure fixtures and hostile metadata; foreign-media and packaging qualification remain outstanding.
 
 ## 7. Technical references and provenance
 
