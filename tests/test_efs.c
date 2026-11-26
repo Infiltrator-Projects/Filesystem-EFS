@@ -48,6 +48,15 @@ static void fixture(void){
         memset(disk+(12+2*i)*B,i+1,B);
     }
     memset(disk+6*B,0xa5,B);disk[9*B]=0x5a;
+    /* Native IRIX bitmap may mark inode-table bits free. They are not
+     * allocator data and must still be reported as reserved. */
+    for(unsigned cg=0;cg<2;cg++)
+        for(unsigned b=3+60*cg;b<3+60*(cg+1);b++)
+            disk[2*B+b/8]|=(uint8_t)(1u<<(b%8));
+    const unsigned used[]={5,6,9,10,11,12,14,16,18,20,22,24,26,28,30,32,34,36};
+    for(unsigned i=0;i<sizeof used/sizeof used[0];i++){
+        unsigned b=used[i];disk[2*B+b/8]&=(uint8_t)~(1u<<(b%8));
+    }
     memcpy(baseline,disk,SIZE);
 }
 static int rd(void *ctx,uint64_t at,void *p,uint32_t n){
@@ -69,7 +78,9 @@ int main(int argc,char **argv){
     const IfsFsVolumeOpsV2 *vol=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_VOLUME);
     const IfsFsDefragOpsV2 *m=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_DEFRAG);
     assert(c && vol && m && m->header.capabilities==IFS_FS_DEFRAG_MAP);
-    assert(!c->write && !c->create && !vol->format && !m->execute);
+    assert(!c->write && !c->create && vol->format && !m->execute);
+    const IfsFsAllocationOpsV2 *a=(const void*)ifs_fs_group_v2(api,IFS_FS_GROUP_ALLOCATION);
+    assert(a && a->header.capabilities==IFS_FS_ALLOCATION_MAP && a->map);
     fixture();
     IfsFsHostRuntimeV2 h={.abi_version=2,.structure_bytes=sizeof h,
       .capabilities=IFS_FS_HOST_READ_ONLY,.volume_bytes=SIZE,
@@ -101,6 +112,25 @@ int main(int argc,char **argv){
         IfsFsExtentV2 range;uint32_t n=99;
         assert(m->map(v,"/sub/indirect",13,&range,1,&n)==IFS_FS_END && !n);
         assert(m->map(v,"/empty",0,&range,1,&n)==IFS_FS_END && !n);
+        uint64_t at=0,free=0,unknown=0;
+        for(;;){
+            IfsFsAllocationRangeV2 page[2];uint64_t next=at;uint32_t n=0;
+            int rc=a->map(v,at,page,2,&n);
+            assert(ifs_fs_allocation_page_v2_valid(SIZE,at,rc,page,2,n,&next,&unknown));
+            if(rc==IFS_FS_END)break;
+            for(uint32_t i=0;i<n;i++){
+                const IfsFsAllocationRangeV2 *p=&page[i];
+                if(p->state==IFS_FS_SPACE_FREE)free+=p->length;
+                for(uint64_t b=p->physical_offset/B;b<(p->physical_offset+p->length)/B;b++){
+                    int is_data=b>=3 && b<123 && (b-3)%60>=2;
+                    int bit=(disk[2*B+b/8]>>(b%8))&1u;
+                    assert(p->state==(is_data?(bit?IFS_FS_SPACE_FREE:IFS_FS_SPACE_ALLOCATED):IFS_FS_SPACE_RESERVED));
+                }
+            }
+            at=next;
+        }
+        assert(at==SIZE&&!unknown&&free==info.free_bytes&&free==98*B);
+        assert(!memcmp(disk,baseline,SIZE));
         assert(c->unmount(v)==0 && c->stat(v,"/",&e)==IFS_FS_INVALID);
     }
     sector=512;h.logical_sector_bytes=h.physical_sector_bytes=sector;
@@ -108,6 +138,9 @@ int main(int argc,char **argv){
     assert(c->mount(&h,&v,&info)==IFS_FS_ACCESS && !v);
     h.capabilities=IFS_FS_HOST_READ_ONLY;h.write_at=NULL;h.flush=NULL;
     disk[B+88]^=1;assert(c->probe(&h,&variant)==IFS_FS_CORRUPT && !variant);disk[B+88]^=1;
+    disk[2*B+5/8]^=(uint8_t)(1u<<(5%8)); /* false free root */
+    assert(c->mount(&h,&v,&info)==IFS_FS_CORRUPT && !v);
+    memcpy(disk,baseline,SIZE);
     disk[5*B+4]=1;assert(c->mount(&h,&v,&info)==IFS_FS_CORRUPT && !v);memcpy(disk,baseline,SIZE);
     assert(c->mount(&h,&v,&info)==0);
     extent(disk+11*B+8,12,1,1);

@@ -11,8 +11,12 @@ build/EFS.so: native/filesystems/efs/efs.c
 build/test_efs: tests/test_efs.c
 	mkdir -p build
 	$(CC) $(BASE) $(CFLAGS) -o $@ $< -ldl
-check: all build/test_efs
+build/test_format: tests/test_format.c
+	mkdir -p build
+	$(CC) $(BASE) $(CFLAGS) -o $@ $< -ldl
+check: all build/test_efs build/test_format
 	test "$$(nm -D --defined-only build/EFS.so | awk '{print $$3}')" = infiltrator_filesystem_api_v2
 	build/test_efs ./build/EFS.so
+	build/test_format ./build/EFS.so
 clean:
 	rm -rf build

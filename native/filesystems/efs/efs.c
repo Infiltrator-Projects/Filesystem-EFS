@@ -26,6 +26,7 @@ typedef struct {
 typedef struct {
     IfsFsHostRuntimeV2 host;
     Geometry g;
+    uint8_t *bitmap;
     uintptr_t token;
 } Session;
 static Session session;
@@ -37,6 +38,8 @@ static int live(void *v){return v && (uintptr_t)v==session.token;}
 static uint32_t be16(const uint8_t *p){return ((uint32_t)p[0]<<8)|p[1];}
 static uint32_t be24(const uint8_t *p){return (be16(p)<<8)|p[2];}
 static uint32_t be32(const uint8_t *p){return (be16(p)<<16)|be16(p+2);}
+static void put16(uint8_t *p,uint32_t n){p[0]=(uint8_t)(n>>8);p[1]=(uint8_t)n;}
+static void put32(uint8_t *p,uint32_t n){put16(p,n>>16);put16(p+2,n);}
 static int cancelled(const IfsFsHostRuntimeV2 *h){return h->cancelled && h->cancelled(h->context);}
 static int read_bytes(const IfsFsHostRuntimeV2 *h,uint64_t off,void *p,uint32_t n)
 {return ifs_fs_host_read_bytes_v2(h,off,p,n);}
@@ -74,10 +77,11 @@ static int geometry(const IfsFsHostRuntimeV2 *h,Geometry *g)
     const uint64_t bmend=(uint64_t)g->bitmap+(g->bitmap_bytes+511ull)/BB;
     if(g->size>0x1000000u || g->size>h->volume_bytes/BB ||
        g->first<3u || !g->groups || !g->inodes || g->inodes>=g->group ||
-       end>g->size || g->bitmap<2u || bmend>g->size ||
-       g->bitmap_bytes<(g->size+7u)/8u ||
+       end>g->size || g->bitmap<2u || bmend>h->volume_bytes/BB ||
+       g->bitmap_bytes<(g->size+7u)/8u || g->bitmap_bytes>0x200000u ||
        (g->bitmap<end && bmend>g->first) ||
-       (g->replica && (g->replica>=g->size || g->replica<end)) ||
+       (g->replica && (g->replica>=h->volume_bytes/BB || g->replica<end ||
+                       (g->replica>=g->bitmap && g->replica<bmend))) ||
        g->free_blocks>(uint64_t)(g->group-g->inodes)*g->groups ||
        be32(p+52)>(uint64_t)g->inodes*g->groups*4u)
         return IFS_FS_CORRUPT;
@@ -90,6 +94,35 @@ static int probe(const IfsFsHostRuntimeV2 *h,uint32_t *variant)
     int rc=geometry(h,&g);
     if(!rc)*variant=g.magic;
     return rc;
+}
+/* EFS has a native one-bit-per-basic-block bitmap. The cylinder group
+ * inode tables, boot and superblock areas are outside the data allocator
+ * even on foreign media where their bits are set. Never expose them as
+ * free. Bit numbering is low-bit first within each byte. */
+static int data_block(const Geometry *g,uint64_t b)
+{
+    if(b<g->first)return 0;
+    uint64_t rel=b-g->first;
+    return rel/g->group<g->groups && rel%g->group>=g->inodes;
+}
+static int free_bit(const uint8_t *bitmap,uint32_t b)
+{return (bitmap[b/8u]&(uint8_t)(1u<<(b%8u)))!=0;}
+static int load_bitmap(Session *s)
+{
+    const Geometry *g=&s->g;const IfsFsHostRuntimeV2 *h=&s->host;
+    uint8_t *p=h->allocate(h->context,g->bitmap_bytes);
+    if(!p)return IFS_FS_NO_MEMORY;
+    int rc=read_bytes(h,(uint64_t)g->bitmap*BB,p,g->bitmap_bytes);
+    uint64_t free=0;
+    if(!rc)for(uint32_t cg=0;cg<g->groups;++cg){
+        if(cancelled(h)){rc=IFS_FS_BUSY;break;}
+        uint32_t start=g->first+cg*g->group+g->inodes;
+        uint32_t end=g->first+(cg+1u)*g->group;
+        for(uint32_t b=start;b<end;++b)free+=(unsigned)free_bit(p,b);
+    }
+    if(!rc && free!=g->free_blocks)rc=IFS_FS_CORRUPT;
+    if(rc){h->release(h->context,p);return rc;}
+    s->bitmap=p;return IFS_FS_OK;
 }
 static int inode_load(const Session *s,uint32_t ino,Inode *out)
 {
@@ -124,6 +157,8 @@ static int decode_extent(const Session *s,const uint8_t *p,Extent *e)
     uint32_t at=e->physical-g->first,group=at/g->group,within=at%g->group;
     if(group>=g->groups || within<g->inodes || e->count>g->group-within)
         return IFS_FS_CORRUPT;
+    for(uint32_t i=0;s->bitmap && i<e->count;++i)
+        if(free_bit(s->bitmap,e->physical+i))return IFS_FS_CORRUPT;
     return IFS_FS_OK;
 }
 /* Mark actual physical blocks of the object, including indirect tables.
@@ -292,15 +327,20 @@ static int mount_impl(const IfsFsHostRuntimeV2 *h,void **v,IfsFsVolumeInfoV2 *o)
     size_t n=h->structure_bytes<sizeof(session.host)?h->structure_bytes:sizeof(session.host);
     memcpy(&session.host,h,n);session.host.structure_bytes=(uint32_t)n;
     Inode root;Dirent dummy;
-    rc=inode_load(&session,ROOT,&root);
+    rc=load_bitmap(&session);
+    if(!rc)rc=inode_load(&session,ROOT,&root);
     if(!rc && root.type!=IFS_FS_ENTRY_DIRECTORY)rc=IFS_FS_CORRUPT;
     if(!rc){rc=directory_find(&session,&root,NULL,0,UINT32_MAX,&dummy);if(rc==IFS_FS_END)rc=IFS_FS_OK;}
-    if(rc){session=(Session){0};return rc;}
+    if(rc){
+        if(session.bitmap)h->release(h->context,session.bitmap);
+        session=(Session){0};return rc;
+    }
     session.token=++generation;*v=(void *)session.token;volume_info(o);return IFS_FS_OK;
 }
 static int unmount_impl(void *v)
 {
     if(!live(v))return IFS_FS_INVALID;
+    session.host.release(session.host.context,session.bitmap);
     session=(Session){0};return IFS_FS_OK;
 }
 static int fill_entry(const Inode *ino,const Dirent *ent,IfsFsEntryV2 *o)
@@ -360,6 +400,143 @@ static int map_impl(void *v,const char *path,uint64_t first,IfsFsExtentV2 *out,u
     if(ext)session.host.release(session.host.context,ext);
     *written=count;return count?IFS_FS_OK:IFS_FS_END;
 }
+/* Complete partition-relative allocation map from the validated native
+ * bitmap and cylinder-group geometry. The tail beyond the EFS data area,
+ * including a replica superblock, remains reserved. */
+static int allocation_impl(void *v,uint64_t first,IfsFsAllocationRangeV2 *out,
+                           uint32_t capacity,uint32_t *written)
+{
+    if(!live(v)||!out||!capacity||capacity>64u||first>session.host.volume_bytes)
+        return IFS_FS_INVALID;
+    if(first==session.host.volume_bytes)return IFS_FS_END;
+    IfsFsAllocationRangeV2 page[64]={{0}};
+    uint64_t at=first;uint32_t count=0,scanned=0;
+    while(at<session.host.volume_bytes && scanned<65536u){
+        if(cancelled(&session.host))return IFS_FS_BUSY;
+        uint64_t b=at/BB,end=(b+1u)*BB;
+        if(end>session.host.volume_bytes)end=session.host.volume_bytes;
+        uint32_t state=IFS_FS_SPACE_RESERVED;
+        if(data_block(&session.g,b))
+            state=free_bit(session.bitmap,(uint32_t)b)?IFS_FS_SPACE_FREE:IFS_FS_SPACE_ALLOCATED;
+        if(count && page[count-1u].state==state)page[count-1u].length+=end-at;
+        else {
+            if(count==capacity)break;
+            page[count++]=(IfsFsAllocationRangeV2){.physical_offset=at,.length=end-at,.state=state};
+        }
+        at=end;++scanned;
+    }
+    memcpy(out,page,count*sizeof(*page));*written=count;return IFS_FS_OK;
+}
+static int allocation_map(void *v,uint64_t first,IfsFsAllocationRangeV2 *out,
+                          uint32_t capacity,uint32_t *written)
+{
+    if(!written)return IFS_FS_INVALID;
+    *written=0;
+    if(!enter())return IFS_FS_BUSY;
+    return leave(allocation_impl(v,first,out,capacity,written));
+}
+
+#define FORMAT_MIN (UINT64_C(1024)*1024u)
+#define FORMAT_MAX (UINT64_C(0x1000000)*BB)
+static int write_bytes(const IfsFsHostRuntimeV2 *h,uint64_t off,const void *p,uint32_t n)
+{return ifs_fs_host_write_bytes_v2(h,off,p,n);}
+static int flush(const IfsFsHostRuntimeV2 *h)
+{return h->flush(h->context)?IFS_FS_IO_ERROR:IFS_FS_OK;}
+static void set_free(uint8_t *p,uint32_t b)
+{p[b/8u]|=(uint8_t)(1u<<(b%8u));}
+static void make_dir_entry(uint8_t *p,uint32_t slot,uint32_t offset,const char *name,uint32_t n)
+{
+    p[2]=(uint8_t)(offset/2u);p[3]=(uint8_t)(slot+1u);
+    p[4u+slot]=(uint8_t)(offset/2u);
+    put32(p+offset,ROOT);p[offset+4u]=(uint8_t)n;memcpy(p+offset+5u,name,n);
+}
+/* Format a conventional uniform-cylinder-group EFS partition with a
+ * native free bitmap and primary/replica superblocks. Invalidate the
+ * primary before modifying metadata and publish it only after the root,
+ * bitmap, inode tables and replica reach durable storage. This is
+ * destructive formatting, not a transaction-recovery implementation. */
+static int format_impl(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *label,uint32_t flags)
+{
+    if(!ifs_fs_host_v2_valid(h))return IFS_FS_INVALID;
+    if(h->capabilities&IFS_FS_HOST_READ_ONLY)return IFS_FS_ACCESS;
+    if(session.token)return IFS_FS_BUSY;
+    if(variant!=0x72959u || flags || h->volume_bytes<FORMAT_MIN ||
+       h->volume_bytes>FORMAT_MAX || h->volume_bytes%h->logical_sector_bytes ||
+       h->logical_sector_bytes>4096u)return IFS_FS_UNSUPPORTED;
+    uint32_t label_len=0;
+    if(label)while(label_len<7u && label[label_len]){
+        unsigned char c=(unsigned char)label[label_len];
+        if(c<32u||c>126u)return IFS_FS_INVALID;
+        ++label_len;
+    }
+    if(label_len>6u)return IFS_FS_INVALID;
+    uint32_t total=(uint32_t)(h->volume_bytes/BB),bmsize=(total+7u)/8u;
+    uint32_t bmblocks=(bmsize+511u)/BB,first=2u+bmblocks;
+    uint32_t usable=total-first-1u,groups=(usable+65535u)/65536u;
+    uint32_t group=usable/groups,inodes=group/32u;
+    if(!inodes)inodes=1u;
+    uint32_t end=first+groups*group,root=first+inodes;
+    uint8_t *bitmap=h->allocate(h->context,(size_t)bmblocks*BB);
+    if(!bitmap)return IFS_FS_NO_MEMORY;
+    memset(bitmap,0,(size_t)bmblocks*BB);
+    for(uint32_t cg=0;cg<groups;++cg)
+        for(uint32_t b=first+cg*group+inodes;b<first+(cg+1u)*group;++b)
+            if(b!=root)set_free(bitmap,b);
+    uint8_t p[BB]={0},sb[BB]={0};
+    int rc=cancelled(h)?IFS_FS_BUSY:write_bytes(h,BB,p,BB);
+    if(!rc)rc=flush(h);
+    if(rc)goto done;
+    for(uint32_t cg=0;cg<groups;++cg){
+        for(uint32_t i=0;i<inodes;++i){
+            if(cancelled(h)){rc=IFS_FS_BUSY;goto done;}
+            memset(p,0,BB);
+            if(!cg && !i){
+                uint8_t *inode=p+ROOT*DINODE;
+                put16(inode,0040755u);put16(inode+2,2u);
+                put32(inode+8,BB);put16(inode+28,1u);
+                inode[33]=(uint8_t)(root>>16);inode[34]=(uint8_t)(root>>8);
+                inode[35]=(uint8_t)root;inode[36]=1u;
+            }
+            rc=write_bytes(h,(uint64_t)(first+cg*group+i)*BB,p,BB);
+            if(rc)goto done;
+        }
+    }
+    memset(p,0,BB);put16(p,0xbeefu);
+    make_dir_entry(p,0u,504u,".",1u);
+    make_dir_entry(p,1u,496u,"..",2u);
+    rc=write_bytes(h,(uint64_t)root*BB,p,BB);if(rc)goto done;
+    rc=write_bytes(h,2u*BB,bitmap,bmblocks*BB);if(rc)goto done;
+    put32(sb,end);put32(sb+4,first);put32(sb+8,group);
+    put16(sb+12,inodes);put16(sb+14,63u);put16(sb+16,1u);put16(sb+18,groups);
+    put32(sb+28,0x72959u);
+    if(label_len){memcpy(sb+32,label,label_len);memcpy(sb+38,label,label_len);}
+    put32(sb+44,bmsize);put32(sb+48,groups*(group-inodes)-1u);
+    put32(sb+52,groups*inodes*4u-3u);
+    put32(sb+60,total-1u);put32(sb+64,ROOT);
+    put32(sb+88,super_checksum(sb,1));
+    rc=flush(h);if(rc)goto done;
+    rc=write_bytes(h,(uint64_t)(total-1u)*BB,sb,BB);if(rc)goto done;
+    rc=flush(h);if(rc)goto done;
+    if(cancelled(h)){rc=IFS_FS_BUSY;goto done;}
+    rc=write_bytes(h,BB,sb,BB);
+    if(!rc)rc=flush(h);
+    if(rc){
+        memset(p,0,BB);
+        (void)write_bytes(h,BB,p,BB);(void)flush(h);goto done;
+    }
+    Geometry g;rc=geometry(h,&g);
+done:
+    h->release(h->context,bitmap);return rc;
+}
+static int format_profile(IfsFsFormatProfileV2 *p)
+{
+    if(!p||p->structure_bytes<sizeof(*p))return IFS_FS_INVALID;
+    *p=(IfsFsFormatProfileV2){.structure_bytes=sizeof *p,.flags=IFS_FS_FORMAT_ACCEPTS_LABEL,
+        .format_variant=0x72959u,.probe_variant=0x72959u,.exact_block_bytes=BB,
+        .layout=IFS_FS_LAYOUT_MULTI_EXTENT,.minimum_bytes=FORMAT_MIN,
+        .recommended_bytes=16u*1024u*1024u,.maximum_bytes=FORMAT_MAX};
+    return IFS_FS_OK;
+}
 static int query_impl(void *v,IfsFsVolumeInfoV2 *o)
 {
     if(!live(v)||!o||o->structure_bytes<sizeof *o)return IFS_FS_INVALID;
@@ -382,6 +559,7 @@ WRAP(list_path,(void *v,const char *p,uint32_t i,IfsFsEntryV2 *o),list_impl(v,p,
 WRAP(read_path,(void *v,const char *p,uint64_t at,void *b,uint32_t n),read_impl(v,p,at,b,n))
 WRAP(query_volume,(void *v,IfsFsVolumeInfoV2 *o),query_impl(v,o))
 WRAP(label,(void *v,char *p,uint32_t c,uint32_t *n),label_impl(v,p,c,n))
+WRAP(format,(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *name,uint32_t flags),format_impl(h,variant,name,flags))
 static int map_path(void *v,const char *p,uint64_t first,IfsFsExtentV2 *out,uint32_t c,uint32_t *n)
 {
     if(n)*n=0;
@@ -394,7 +572,14 @@ static const IfsFsCoreOpsV2 core={
     .probe=probe,.mount=mount,.unmount=unmount,.stat=stat_path,.directory_entry=list_path,.read=read_path};
 static const IfsFsVolumeOpsV2 volume={
     .header={IFS_FS_GROUP_ABI_V2,sizeof volume,IFS_FS_GROUP_VOLUME,0,
-        IFS_FS_VOLUME_QUERY|IFS_FS_VOLUME_LABEL_GET},.query=query_volume,.label=label};
+        IFS_FS_VOLUME_QUERY|IFS_FS_VOLUME_LABEL_GET|IFS_FS_VOLUME_FORMAT},
+    .query=query_volume,.label=label,.format=format};
+static const IfsFsAllocationOpsV2 allocation={
+    .header={IFS_FS_GROUP_ABI_V2,sizeof allocation,IFS_FS_GROUP_ALLOCATION,0,IFS_FS_ALLOCATION_MAP},
+    .map=allocation_map};
+static const IfsFsFormatProfileOpsV2 profile={
+    .header={IFS_FS_GROUP_ABI_V2,sizeof profile,IFS_FS_GROUP_FORMAT_PROFILE,0,IFS_FS_FORMAT_PROFILE_DEFAULT},
+    .get_default=format_profile};
 static const IfsFsDefragOpsV2 defrag={
     .header={IFS_FS_GROUP_ABI_V2,sizeof defrag,IFS_FS_GROUP_DEFRAG,0,IFS_FS_DEFRAG_MAP},
     .map=map_path};
@@ -404,6 +589,8 @@ static const IfsFsGroupHeaderV2 *group(uint32_t id,uint32_t lo,uint32_t hi)
     if(id==IFS_FS_GROUP_CORE)return &core.header;
     if(id==IFS_FS_GROUP_VOLUME)return &volume.header;
     if(id==IFS_FS_GROUP_DEFRAG)return &defrag.header;
+    if(id==IFS_FS_GROUP_ALLOCATION)return &allocation.header;
+    if(id==IFS_FS_GROUP_FORMAT_PROFILE)return &profile.header;
     return NULL;
 }
 __attribute__((used,section(".ifsmeta")))static const char identity[]="IFS-MODULE:efs:common2";
@@ -411,6 +598,7 @@ static const IfsFsModuleApiV2 api={
     .abi_version=2,.structure_bytes=sizeof api,.format_id="efs",
     .runtime_profiles=IFS_FS_PROFILE_HOSTED,
     .group_mask=IFS_FS_GROUP_BIT(IFS_FS_GROUP_CORE)|IFS_FS_GROUP_BIT(IFS_FS_GROUP_VOLUME)|
-        IFS_FS_GROUP_BIT(IFS_FS_GROUP_DEFRAG),.query_group=group};
+        IFS_FS_GROUP_BIT(IFS_FS_GROUP_DEFRAG)|IFS_FS_GROUP_BIT(IFS_FS_GROUP_ALLOCATION)|
+        IFS_FS_GROUP_BIT(IFS_FS_GROUP_FORMAT_PROFILE),.query_group=group};
 __attribute__((visibility("default")))
 const IfsFsModuleApiV2 *infiltrator_filesystem_api_v2(void){return &api;}
