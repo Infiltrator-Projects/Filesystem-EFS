@@ -287,7 +287,7 @@ static int directory_walk(const Session *s,const Inode *dir,DirVisit visit,void 
     for(uint32_t i=0;i<dir->count && !rc;++i)
         for(uint32_t k=0;k<ext[i].count && !rc;++k){
             if(cancelled(&s->host)){rc=IFS_FS_BUSY;break;}
-            uint8_t p[BB],used[BB]={0};
+            uint8_t p[BB],used[BB/8]={0};
             rc=read_bytes(&s->host,(uint64_t)(ext[i].physical+k)*BB,p,BB);
             if(rc)break;
             if(be16(p)!=0xbeefu){rc=IFS_FS_CORRUPT;break;}
@@ -299,9 +299,14 @@ static int directory_walk(const Session *s,const Inode *dir,DirVisit visit,void 
                 uint32_t ino=be32(p+off),n=p[off+4];
                 if(!n || n>BB-off-5u || ino<ROOT ||
                    ino/(s->g.inodes*4u)>=s->g.groups){rc=IFS_FS_CORRUPT;break;}
-                for(uint32_t j=off;j<off+5u+n;++j){
-                    if(used[j]){rc=IFS_FS_CORRUPT;break;}
-                    used[j]=1;
+                /* Bounded bitset tracks occupied directory bytes without
+                 * a vectorised variable-length store near the block end. */
+                uint32_t end=off+5u+n;
+                for(uint32_t j=off;j<end;++j){
+                    if(j>=BB){rc=IFS_FS_CORRUPT;break;}
+                    uint8_t mask=(uint8_t)(1u<<(j%8u));
+                    if(used[j/8u]&mask){rc=IFS_FS_CORRUPT;break;}
+                    used[j/8u]|=mask;
                 }
                 if(rc)break;
                 Dirent e={.ino=ino,.len=n};
