@@ -305,6 +305,57 @@ static int replace_file(Mutation *m,Object *o,uint32_t bytes,uint32_t at,const v
     rc=replace_stream(m,o,bytes,file_source,&f);
     mem_drop(ext);return rc;
 }
+/* Pure append and zero-extension retain existing owned payload. Only the
+ * old partial EOF block needs redo protection. New extent tables replace
+ * the previous native tables in the same transaction. This avoids
+ * quadratic full-file COW during repeated streaming writes. */
+static int append_file(Mutation *m,Object *o,uint32_t bytes,uint32_t at,
+                       const void *data,uint32_t n)
+{
+    Extent *old=NULL;int rc=extents(&session,&o->old,&old);if(rc)return rc;
+    Runs added={0},all={0};
+    uint32_t before=(o->old.bytes+BB-1u)/BB,after=(bytes+BB-1u)/BB;
+    rc=allocate_runs(m,after-before,&added);if(rc)goto done;
+    all.capacity=o->old.count+added.count;
+    if(all.capacity>32767u){rc=IFS_FS_NO_SPACE;goto done;}
+    if(all.capacity){
+        all.e=mem_new((size_t)all.capacity*sizeof(*all.e));
+        if(!all.e){rc=IFS_FS_NO_MEMORY;goto done;}
+    }
+    for(uint32_t i=0;i<o->old.count;i++)all.e[all.count++]=old[i];
+    for(uint32_t i=0;i<added.count;i++){
+        Extent e=added.e[i];e.logical+=before;
+        Extent *last=all.count?&all.e[all.count-1u]:NULL;
+        if(last && last->physical+last->count==e.physical &&
+           last->count+e.count<=255u &&
+           (last->physical-session.g.first)/session.g.group==
+           (e.physical-session.g.first)/session.g.group)last->count+=e.count;
+        else all.e[all.count++]=e;
+    }
+    rc=build_descriptors(m,o,&all);if(rc)goto done;
+    rc=release_tables(m,&o->old);if(rc)goto done;
+    FileSource source={.old=&o->old,.ext=old,.bytes=bytes,.at=at,.length=n,.data=data};
+    if(o->old.bytes%BB){
+        uint8_t p[BB]={0};uint32_t logical=before-1u;
+        rc=file_source(&source,logical,p);if(rc)goto done;
+        const Extent *last=&old[o->old.count-1u];
+        rc=tx_stage(&m->tx,(uint64_t)(last->physical+last->count-1u)*BB,p,BB);
+        if(rc)goto done;
+    }
+    for(uint32_t i=0;i<added.count&&!rc;i++)
+        for(uint32_t j=0;j<added.e[i].count;j++){
+            if(cancelled(mh())){rc=IFS_FS_BUSY;break;}
+            uint8_t p[BB]={0};
+            rc=file_source(&source,before+added.e[i].logical+j,p);if(rc)break;
+            rc=write_new_block(m,added.e[i].physical+j,p);if(rc)break;
+        }
+    if(!rc){
+        put32(o->raw+8,bytes);stamp(o->raw,!o->old.bytes);
+        rc=stage_inode(m,o->old.ino,o->raw);
+    }
+done:
+    runs_drop(&all);runs_drop(&added);mem_drop(old);return rc;
+}
 static int names_append(Names *n,const Dirent *e)
 {
     if(n->count==n->capacity){
@@ -524,7 +575,10 @@ static int rewrite_with_reservation(Mutation *m,Object *o,uint32_t bytes,
     if(can_use_reservation(o,r,bytes,at,n))
         return use_reservation(m,o,r,bytes,at,p,n);
     int rc=reservation_delete(m,o->old.ino,1);
-    return rc?rc:replace_file(m,o,bytes,at,p,n);
+    if(rc)return rc;
+    if(!r && bytes>o->old.bytes && (!n || at>=o->old.bytes))
+        return append_file(m,o,bytes,at,p,n);
+    return replace_file(m,o,bytes,at,p,n);
 }
 static int resolve_parent(const char *path,Object *parent,Dirent *leaf)
 {

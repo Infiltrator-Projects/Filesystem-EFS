@@ -674,7 +674,9 @@ static int format_impl(const IfsFsHostRuntimeV2 *h,uint32_t variant,const char *
     if(label_len>6u)return IFS_FS_INVALID;
     uint32_t total=(uint32_t)(h->volume_bytes/BB),bmsize=(total+7u)/8u;
     uint32_t bmblocks=(bmsize+511u)/BB,first=journal_first(h);
-    uint32_t usable=total-first-1u,groups=(usable+65535u)/65536u;
+    /* Larger cylinder groups allow a physically contiguous 60 MiB file
+     * plus its adjacent reserve. Inode-table count still fits 16 bits. */
+    uint32_t usable=total-first-1u,groups=(usable+262143u)/262144u;
     uint32_t group=usable/groups,inodes=group/32u;
     if(!inodes)inodes=1u;
     uint32_t end=first+groups*group,root=first+inodes;

@@ -58,7 +58,8 @@ int main(int argc,char **argv){
         assert(c->remove(volume,"/left")==IFS_FS_BUSY&&d.writes==writes);
         assert(c->rename(volume,"/left","/left/deep/cycle")==IFS_FS_INVALID&&d.writes==writes);
         for(unsigned i=0;i<DATA;i++)expected[i]=(uint8_t)(i*31u+i/511u);
-        assert(c->write(volume,"/left/deep/file",0,expected,DATA)==0);
+        for(unsigned at=0;at<DATA;at+=65536u)
+            assert(c->write(volume,"/left/deep/file",at,expected+at,65536u)==0);
         clean(v,volume);
         uint8_t patch[513];memset(patch,0x7a,sizeof patch);
         assert(c->write(volume,"/left/deep/file",511,patch,sizeof patch)==0);
