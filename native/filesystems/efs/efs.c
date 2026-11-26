@@ -8,8 +8,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdatomic.h>
-#include <string.h>
-#include <stdlib.h>
+#include "runtime.h"
 
 enum { BB=512, DINODE=128, DIRECT=12, ROOT=2, MAX_NAME=255 };
 enum { REG=0100000, DIR=0040000, LINK=0120000 };
@@ -1016,7 +1015,7 @@ static const IfsFsGroupHeaderV2 *group(uint32_t id,uint32_t lo,uint32_t hi)
 __attribute__((used,section(".ifsmeta")))static const char identity[]="IFS-MODULE:efs:common2";
 static const IfsFsModuleApiV2 api={
     .abi_version=2,.structure_bytes=sizeof api,.format_id="efs",
-    .runtime_profiles=IFS_FS_PROFILE_HOSTED,
+    .runtime_profiles=IFS_FS_PROFILE_HOSTED|IFS_FS_PROFILE_FREESTANDING,
     .group_mask=IFS_FS_GROUP_BIT(IFS_FS_GROUP_CORE)|IFS_FS_GROUP_BIT(IFS_FS_GROUP_VOLUME)|
         IFS_FS_GROUP_BIT(IFS_FS_GROUP_DEFRAG)|IFS_FS_GROUP_BIT(IFS_FS_GROUP_ALLOCATION)|
         IFS_FS_GROUP_BIT(IFS_FS_GROUP_FORMAT_PROFILE),.query_group=group};

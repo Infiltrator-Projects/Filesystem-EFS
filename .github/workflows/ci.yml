@@ -1,4 +1,4 @@
-name: Native EFS Common V2 development qualification
+name: Native EFS Common V2 qualification and release
 on:
   push:
     branches: [main]
@@ -16,6 +16,10 @@ jobs:
           git -C Libraries checkout 225e640ebed5351b1481bfbeef1a6144ca5146e7
       - name: Compile and test the actual shared object
         run: make check
+      - name: Native CPU qualification
+        run: |
+          make clean
+          make PROFILE=aggressive check
       - name: Address and undefined behaviour sanitizers
         run: |
           make clean
@@ -30,3 +34,61 @@ jobs:
           git -C Libraries checkout 225e640ebed5351b1481bfbeef1a6144ca5146e7
           make all build/test_oracle
           sh tests/oracle.sh
+
+  publish:
+    needs: [native, interoperability]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package and qualify exact installed binary and source installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          version=$(cat VERSION)
+          git clone https://github.com/Infiltrator-Projects/Libraries.git Libraries
+          git -C Libraries checkout 225e640ebed5351b1481bfbeef1a6144ca5146e7
+          make check build/test_oracle
+          sh scripts/package.sh dist
+          deb="dist/infiltrator-filesystem-efs_${version}_amd64.deb"
+          test "$(dpkg-deb -f "$deb" Architecture)" = amd64
+          test "$(dpkg-deb -f "$deb" Version)" = "$version"
+          dpkg-deb -x "$deb" /tmp/efs-portable
+          so=/tmp/efs-portable/System/Filesystems/EFS.so
+          cmp build/EFS.so "$so"
+          test -z "$(nm -D --undefined-only "$so")"
+          ! readelf -d "$so" | grep -q NEEDED
+          for test in efs format journal namespace namespace_recovery defrag defrag_recovery; do
+            "build/test_$test" "$so"
+          done
+          sh tests/oracle.sh "$so"
+          common=$(git -C Libraries rev-parse HEAD)
+          curl -fsSL --retry 3 "https://codeload.github.com/Infiltrator-Projects/Filesystem-EFS/tar.gz/$GITHUB_SHA" -o /tmp/efs-source.tar.gz
+          curl -fsSL --retry 3 "https://codeload.github.com/Infiltrator-Projects/Libraries/tar.gz/$common" -o /tmp/efs-common.tar.gz
+          source_hash=$(sha256sum /tmp/efs-source.tar.gz | cut -d' ' -f1)
+          common_hash=$(sha256sum /tmp/efs-common.tar.gz | cut -d' ' -f1)
+          run="dist/filesystem-efs-$version-native-installer.run"
+          sed -e "s/@SOURCE@/$GITHUB_SHA/g" -e "s/@COMMON@/$common/g" -e "s/@SOURCE_HASH@/$source_hash/g" -e "s/@COMMON_HASH@/$common_hash/g" scripts/installer.in > "$run"
+          chmod +x "$run"
+          "$run" --profile aggressive --build-only --output /tmp/efs-native
+          native="/tmp/efs-native/infiltrator-filesystem-efs_${version}_amd64.deb"
+          test -s "$native"
+          dpkg-deb -x "$native" /tmp/efs-native-package
+          native_so=/tmp/efs-native-package/System/Filesystems/EFS.so
+          test -z "$(nm -D --undefined-only "$native_so")"
+          ! readelf -d "$native_so" | grep -q NEEDED
+          for test in efs format journal namespace namespace_recovery defrag defrag_recovery; do
+            "build/test_$test" "$native_so"
+          done
+          sh tests/oracle.sh "$native_so"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "Release exists; immutable assets retained."
+            exit 0
+          fi
+          gh release create "v$version" --target "$GITHUB_SHA" --title "EFS v$version" --notes "Independent native Common V2 SGI EFS. Durable provider-formatted writable namespace, actual standard and growth relocation, persistent adjacent reserves, independent bidirectional EFS interoperability. Foreign media are read-only. Hosted and import-free freestanding builds; firmware and kernel execution not separately qualified." "$deb" "$run"

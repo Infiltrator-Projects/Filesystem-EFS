@@ -1,0 +1,35 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -euo pipefail
+profile=aggressive
+output="$PWD"
+build_only=0
+while (($#)); do
+ case "$1" in
+ --profile) profile="$2"; shift 2;;
+ --build-only) build_only=1; shift;;
+ --system-package-mode) shift;;
+ --output) output="$2"; shift 2;;
+ *) echo "Unsupported option: $1" >&2; exit 2;;
+ esac
+done
+[[ "$profile" == portable || "$profile" == aggressive ]]
+output=$(realpath -m "$output")
+mkdir -p "$output"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+curl --fail --location --retry 3 -o source.tar.gz "https://codeload.github.com/Infiltrator-Projects/Filesystem-EFS/tar.gz/@SOURCE@"
+curl --fail --location --retry 3 -o libraries.tar.gz "https://codeload.github.com/Infiltrator-Projects/Libraries/tar.gz/@COMMON@"
+printf '%s  %s\n' '@SOURCE_HASH@' source.tar.gz '@COMMON_HASH@' libraries.tar.gz | sha256sum --check
+mkdir source
+tar -xzf source.tar.gz --strip-components=1 -C source
+mkdir -p source/Libraries
+tar -xzf libraries.tar.gz --strip-components=1 -C source/Libraries
+cd source
+make PROFILE="$profile" check
+sh scripts/package.sh "$output"
+if (( !build_only )); then
+ package="$output/infiltrator-filesystem-efs_$(cat VERSION)_amd64.deb"
+ if (( EUID == 0 )); then dpkg -i "$package"; else sudo dpkg -i "$package"; fi
+fi
