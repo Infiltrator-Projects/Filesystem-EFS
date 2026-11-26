@@ -33,11 +33,11 @@ static void slot(unsigned block,unsigned i,unsigned off,unsigned ino,const char 
 static void fixture(void){
     memset(disk,0,sizeof disk);uint8_t *s=disk+B;
     be32(s,128);be32(s+4,3);be32(s+8,60);be16(s+12,2);be16(s+18,2);
-    be32(s+28,0x72959);memcpy(s+32,"EFS",3);be32(s+44,16);be32(s+48,98);be32(s+52,11);
+    be32(s+28,0x72959);memcpy(s+32,"EFS",3);be32(s+44,16);be32(s+48,98);be32(s+52,9);
     checksum();
-    node(2,0040755,512,1);extent(inode(2)+32,5,1,0);
+    node(2,0040755,512,1);be16(inode(2)+2,3);extent(inode(2)+32,5,1,0);
     node(3,0100644,513,2);extent(inode(3)+32,6,1,0);extent(inode(3)+40,9,1,1);
-    node(4,0040755,512,1);extent(inode(4)+32,10,1,0);
+    node(4,0040755,512,1);be16(inode(4)+2,2);extent(inode(4)+32,10,1,0);
     node(5,0100644,13*B,13);extent(inode(5)+32,11,1,1);
     node(6,0100644,0,0);
     slot(5,0,504,2,".");slot(5,1,496,2,"..");slot(5,2,480,3,"small");
@@ -130,6 +130,8 @@ int main(int argc,char **argv){
             at=next;
         }
         assert(at==SIZE&&!unknown&&free==info.free_bytes&&free==98*B);
+        uint64_t errors=99;
+        assert(vol->check(v,0,&errors)==IFS_FS_OK && !errors);
         assert(!memcmp(disk,baseline,SIZE));
         assert(c->unmount(v)==0 && c->stat(v,"/",&e)==IFS_FS_INVALID);
     }
@@ -146,6 +148,21 @@ int main(int argc,char **argv){
     extent(disk+11*B+8,12,1,1);
     uint8_t buf[B];assert(c->read(v,"/sub/indirect",0,buf,B)==IFS_FS_CORRUPT);
     assert(c->unmount(v)==0);memcpy(disk,baseline,SIZE);
+    /* Corruption cases that do not invalidate the basic root mount:
+     * crosslinked file data, orphan allocated block, and link mismatch. */
+    for(unsigned fault=0;fault<4;fault++){
+        assert(c->mount(&h,&v,&info)==0);
+        if(fault==0)extent(inode(3)+32,12,1,0); /* other inode owns block */
+        if(fault==1){
+            disk[2*B+7/8]&=(uint8_t)~(1u<<(7%8)); /* lost allocation */
+            be32(disk+B+48,97);checksum();
+        }
+        if(fault==2)be16(inode(3)+2,2);
+        if(fault==3)memcpy(disk+5*B+456+5,"small",5),disk[5*B+456+4]=5;
+        uint64_t errors=0;
+        assert(vol->check(v,0,&errors)==IFS_FS_OK&&errors);
+        assert(c->unmount(v)==0);memcpy(disk,baseline,SIZE);
+    }
     assert(!memcmp(disk,baseline,SIZE));dlclose(so);
     puts("EFS native structure, payload, indirect extent and corruption regressions passed");
     return 0;

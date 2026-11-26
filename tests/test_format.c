@@ -82,6 +82,8 @@ int main(int argc,char **argv){
             at=next;
         }
         assert(at==d.size&&!unknown&&free==info.free_bytes);
+        uint64_t errors=99;
+        assert(vol->check(v,0,&errors)==IFS_FS_OK&&!errors);
         assert(core->unmount(v)==0);
         writes=d.writes;
         assert(vol->format(&h,p.format_variant,"EFS",0)==IFS_FS_ACCESS&&d.writes==writes);

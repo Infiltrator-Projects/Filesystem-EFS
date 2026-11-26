@@ -10,7 +10,7 @@ Superblock geometry, inode records, direct and indirect extents, directory entri
 
 ## 3. Common V2 implementation and capabilities
 
-Native CORE probe, read-only mount/unmount, stat, enumeration and read; VOLUME query/label/native format, ALLOCATION map, FORMAT_PROFILE and DEFRAG extent mapping are implemented for development qualification. Native bitmap accounting and file-backed format regression are implemented; independent foreign-media, complete integrity verification and mutation/recovery qualification remain outstanding. The target entry point is `infiltrator_filesystem_api_v2`, using bounded, partition-relative host I/O. Implement native probe first, then mount, stat, enumeration, read and volume query where applicable. Consumers must negotiate supported groups and profiles; an unsupported operation must not report success or delegate to a private driver.
+Native CORE probe, read-only mount/unmount, stat, enumeration and read; VOLUME query/label/native format/check, ALLOCATION map, FORMAT_PROFILE and DEFRAG extent mapping are implemented for development qualification. Native bitmap accounting and file-backed format regression are implemented; a whole-inode ownership and namespace integrity pass is implemented. Independent foreign-media and mutation/recovery qualification remain outstanding. The target entry point is `infiltrator_filesystem_api_v2`, using bounded, partition-relative host I/O. Implement native probe first, then mount, stat, enumeration, read and volume query where applicable. Consumers must negotiate supported groups and profiles; an unsupported operation must not report success or delegate to a private driver.
 
 ## 4. Integrity, mutation, allocation and recovery
 
