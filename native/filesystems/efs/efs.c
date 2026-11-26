@@ -378,7 +378,8 @@ static int mount_impl(const IfsFsHostRuntimeV2 *h,void **v,IfsFsVolumeInfoV2 *o)
     }
     if(rc)return rc;
     if(g.dirty)return IFS_FS_UNSUPPORTED;
-    if(g.first==journal_first(h) && jr!=IFS_FS_OK && jr!=IFS_FS_NOT_FOUND)return jr;
+    if(journal_supported(h) && g.first==journal_first(h) && jr!=IFS_FS_OK)
+        return jr==IFS_FS_NOT_FOUND?IFS_FS_CORRUPT:jr;
     if(writable && (jr || g.first!=journal_first(h)))return IFS_FS_ACCESS;
     session=(Session){.g=g,.writable=writable,.recovered=recovered};
     size_t n=h->structure_bytes<sizeof(session.host)?h->structure_bytes:sizeof(session.host);

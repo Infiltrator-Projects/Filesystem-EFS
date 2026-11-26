@@ -20,11 +20,15 @@ build/test_journal: tests/test_journal.c
 build/test_namespace: tests/test_namespace.c
 	mkdir -p build
 	$(CC) $(BASE) $(CFLAGS) -o $@ $< -ldl
-check: all build/test_efs build/test_format build/test_journal build/test_namespace
+build/test_namespace_recovery: tests/test_namespace_recovery.c
+	mkdir -p build
+	$(CC) $(BASE) $(CFLAGS) -o $@ $< -ldl
+check: all build/test_efs build/test_format build/test_journal build/test_namespace build/test_namespace_recovery
 	test "$$(nm -D --defined-only build/EFS.so | awk '{print $$3}')" = infiltrator_filesystem_api_v2
 	build/test_efs ./build/EFS.so
 	build/test_format ./build/EFS.so
 	build/test_journal ./build/EFS.so
 	build/test_namespace ./build/EFS.so
+	build/test_namespace_recovery ./build/EFS.so
 clean:
 	rm -rf build

@@ -337,6 +337,7 @@ static int resolve_parent(const char *path,Object *parent,Dirent *leaf)
     if(!path||path[0]!='/')return IFS_FS_INVALID;
     size_t len=0;while(len<=65536u && path[len])++len;
     if(len<2u||len>65536u)return IFS_FS_INVALID;
+    for(size_t i=1;i<len;i++)if(path[i]=='/'&&path[i-1u]=='/')return IFS_FS_INVALID;
     const char *slash=strrchr(path,'/');size_t n=(size_t)(path+len-slash-1);
     if(!n||n>MAX_NAME||(n==1u&&slash[1]=='.')||
        (n==2u&&slash[1]=='.'&&slash[2]=='.'))return IFS_FS_INVALID;
