@@ -16,9 +16,12 @@ endif
 BASE = -std=c11 -Wall -Wextra -Werror -I$(COMMON)/include
 .PHONY: all check clean
 all: build/EFS.so
-build/EFS.so: native/filesystems/efs/efs.c native/filesystems/efs/journal.h native/filesystems/efs/mutation.h native/filesystems/efs/defrag.h native/filesystems/efs/runtime.h
+build/runtime.o: native/filesystems/efs/runtime.c
 	mkdir -p build
-	$(CC) $(BASE) $(CFLAGS) $(NATIVE) -fPIC -fvisibility=hidden $(LINK) -o $@ $<
+	$(CC) $(BASE) $(CFLAGS) $(NATIVE) -fno-lto -fPIC -fvisibility=hidden -c -o $@ $<
+build/EFS.so: native/filesystems/efs/efs.c native/filesystems/efs/journal.h native/filesystems/efs/mutation.h native/filesystems/efs/defrag.h native/filesystems/efs/runtime.h build/runtime.o
+	mkdir -p build
+	$(CC) $(BASE) $(CFLAGS) $(NATIVE) -fPIC -fvisibility=hidden $(LINK) -o $@ $< build/runtime.o
 build/test_efs: tests/test_efs.c
 	mkdir -p build
 	$(CC) $(BASE) $(CFLAGS) -o $@ $< -ldl
