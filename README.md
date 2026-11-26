@@ -1,38 +1,15 @@
 # Filesystem-EFS
 
-## 1. Purpose and format scope
+Independent SGI Extent File System provider for Common V2, distinct from XFS. Hosted source supports original clean media reading and native journalled formatting, namespace mutation, allocation maps and defragmentation. Foreign media are not writable through the private journal profile. Qualification and release claims depend on exact executed evidence, not this documentation pass.
 
-Silicon Graphics Extent File System (EFS). This repository is the designated independent implementation home for InfiltratorOS. **Native Common V2 reader under development; no release or full qualification is claimed.**
+## Technical documentation
 
-## 2. On-disk architecture and invariants
-
-Superblock geometry, inode records, direct and indirect extents, directory entries and symbolic links determine file mapping. Validate extent offsets, lengths and inode bounds before access. These are design requirements for the native implementation, not claims about code already present in this repository.
-
-## 3. Common V2 implementation and capabilities
-
-Native CORE probe, read-only foreign mount/unmount, writable provider-formatted mount, stat, enumeration, read, create/write/truncate/remove/rename; VOLUME query/label/native format/check, journaled label update and sync, ALLOCATION map, FORMAT_PROFILE and DEFRAG extent mapping, ordinary relocation planning/execution/verification and recovery are implemented for development qualification. Native bitmap accounting and file-backed format regression are implemented; a whole-inode ownership and namespace integrity pass is implemented. Native writable namespace operations are implemented using copy-on-write allocation and the redo journal. File-backed round-trip qualification is included; the cold interruption matrix exercises create, write, truncate, remove, file rename and directory moves across every observed write/flush boundary, including torn and uncertain writes. Independent foreign-media and interruption qualification of relocation remain outstanding. Growth policy is explicitly refused until actual adjacent allocation reservation is implemented. Provider-formatted media reserves a 256 KiB redo journal outside cylinder-group data, with alternating checksummed headers and recovery before writable mount. Foreign media remains read-only. The interruption test exercises the journal through volume-label updates; ordinary relocation now uses the same native transaction engine. The native format now creates a protected EFS directory for real growth-allocation owner files. Reservation validation and allocation-map classification are implemented, but policy 10 remains disabled until reservation creation, consumption and release are transactionally connected. The target entry point is `infiltrator_filesystem_api_v2`, using bounded, partition-relative host I/O. Implement native probe first, then mount, stat, enumeration, read and volume query where applicable. Consumers must negotiate supported groups and profiles; an unsupported operation must not report success or delegate to a private driver.
-
-## 4. Integrity, mutation, allocation and recovery
-
-Mutation, formatting, check/repair and DEFRAG map/plan/execute/verify/recover require format-specific allocation and ordering invariants, exclusive writable host access and demonstrated interruption recovery. Until qualified, reject them before writing. Preserve native disk semantics and do not add a kernel or FUSE fallback as an alternative filesystem authority.
-
-## 5. Build, installation and release
-
-The target installation is `/System/Filesystems/EFS.so` and `/System/Resources/Documentation/Filesystem-EFS.pdf`. Neither file is currently distributed by this repository. Once the implementation qualifies, the intended release is a portable amd64 DEB and CPU-native source-first RUN, with GitHub's automatic source archive. For development only, clone Libraries at 225e640ebed5351b1481bfbeef1a6144ca5146e7 into Libraries and run `make check`. Do not deploy this development provider.
-
-## 6. Qualification and limitations
-
-Independent EFS images, malformed extents and out-of-range inode references. Compare independent payloads and unchanged-image hashes; inject truncation, corruption and I/O faults. Establish exact-revision ABI, hosted and import-free freestanding qualification, then independently test BOOT and kernel integration. CI exercises the actual shared object against native structure fixtures and hostile metadata; foreign-media and packaging qualification remain outstanding.
-
-## 7. Technical references and provenance
-
-- [Design and qualification reference (PDF)](docs/EFS.pdf) — design-stage reference only, with [editable page source](docs/EFS.pages); not an operational manual.
-
-- [Pinned central source baseline](https://github.com/Infiltrator-Projects/Filesystems/tree/101026021d9088d80b7f0f472d9061f0e2c688a3/native/filesystems/efs)
-- [Native design](native/filesystems/efs/DESIGN.md)
-- [Migration and qualification plan](MIGRATION_STATUS.md)
-- [Original-format reference source](docs/EFS.pages) and [PDF](docs/EFS.pdf)
+- [Engineering reference (PDF)](docs/EFS.pdf)
+- [Technical reference (Markdown)](docs/EFS-TECHNICAL-REFERENCE.md)
+- [PDF stream source](docs/EFS.pdfstreams) (plain text)
+- [Native design and historical baseline](native/filesystems/efs/DESIGN.md)
+- [Migration and current source status](MIGRATION_STATUS.md)
 - [Project philosophy](docs/PHILOSOPHY.md)
 - [Common ABI](https://github.com/Infiltrator-Projects/Libraries)
 
-Preserve inherited notices and licences on source extraction; new project-authored code uses GPL-3.0-or-later. The original-format reference is available here; installation of the PDF remains pending. Central code or test results are not evidence of an independent provider.
+Source operations, actual runtime masks and exact qualification evidence govern current support. The prior manuals are preserved in the PDF's historical appendices. Target installation: `/System/Filesystems/EFS.so` and `/System/Resources/Documentation/Filesystem-EFS.pdf`; packaging is not established by this documentation update.

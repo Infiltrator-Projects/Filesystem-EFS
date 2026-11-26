@@ -1,5 +1,7 @@
 # EFS — native filesystem design
 
+> Historical extraction/design baseline. Native Common V2 implementation now exists in source; see [current engineering reference](../../../docs/EFS-TECHNICAL-REFERENCE.md). The following requirements are retained for provenance and are not current status.
+
 ## Format scope
 
 SGI Extent File System, not XFS. This is a design contract, not a claim of implemented capabilities.
