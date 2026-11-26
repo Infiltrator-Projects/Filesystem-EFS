@@ -13,3 +13,5 @@ Independent SGI Extent File System provider for Common V2, distinct from XFS. Ho
 - [Common ABI](https://github.com/Infiltrator-Projects/Libraries)
 
 Source operations, actual runtime masks and exact qualification evidence govern current support. The prior manuals are preserved in the PDF's historical appendices. Target installation: `/System/Filesystems/EFS.so` and `/System/Resources/Documentation/Filesystem-EFS.pdf`; packaging is not established by this documentation update.
+
+The independent interoperability workflow uses a hash-pinned Rusty Backup CLI release solely as a test oracle: foreign formatted media are read through Common V2, and provider formatted media are independently checked and extracted. No oracle binary or invocation is part of production code or installation.

@@ -20,3 +20,13 @@ jobs:
         run: |
           make clean
           make CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" check
+
+  interoperability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git clone https://github.com/Infiltrator-Projects/Libraries.git Libraries
+          git -C Libraries checkout 225e640ebed5351b1481bfbeef1a6144ca5146e7
+          make all build/test_oracle
+          sh tests/oracle.sh
