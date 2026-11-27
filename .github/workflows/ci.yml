@@ -48,7 +48,8 @@ jobs:
           make all
           sh scripts/package.sh dist
           dpkg-deb -x dist/*.deb candidate
-          cmp build/EFS.so candidate/System/Filesystems/EFS.so
+          cmp build/carrier/EFS.so candidate/System/Filesystems/EFS.so
+          cmp docs/EFS.pdf candidate/System/Resources/Documentation/Filesystem-EFS.pdf
           sudo install -Dm644 candidate/System/Filesystems/EFS.so /System/Filesystems/EFS.so
       - name: Build the actual provider-neutral consumer
         run: |
@@ -108,7 +109,8 @@ jobs:
           test "$(dpkg-deb -f "$deb" Version)" = "$version"
           dpkg-deb -x "$deb" /tmp/efs-portable
           so=/tmp/efs-portable/System/Filesystems/EFS.so
-          cmp build/EFS.so "$so"
+          cmp build/carrier/EFS.so "$so"
+          cmp docs/EFS.pdf /tmp/efs-portable/System/Resources/Documentation/Filesystem-EFS.pdf
           test -z "$(nm -D --undefined-only "$so")"
           ! readelf -d "$so" | grep -q NEEDED
           for test in efs format journal namespace namespace_recovery defrag defrag_recovery; do
@@ -128,6 +130,7 @@ jobs:
           test -s "$native"
           dpkg-deb -x "$native" /tmp/efs-native-package
           native_so=/tmp/efs-native-package/System/Filesystems/EFS.so
+          cmp docs/EFS.pdf /tmp/efs-native-package/System/Resources/Documentation/Filesystem-EFS.pdf
           test -z "$(nm -D --undefined-only "$native_so")"
           ! readelf -d "$native_so" | grep -q NEEDED
           for test in efs format journal namespace namespace_recovery defrag defrag_recovery; do
