@@ -64,8 +64,6 @@ The independent provider uses Common V2: https://github.com/Infiltrator-Projects
 
 SGI original manual: https://www.typewritten.org/Manual/SGI/IRIX/6.5.3f/man4/efs.html ; inode layout https://techpubs.jurassic.nl/manpages_0530/cat4/inode.html ; architecture https://tech-pubs.net/SGI_Admin/books/IA_DiskFiles/sgi_html/apa.html ; reader cross-check https://github.com/torvalds/linux/tree/v6.12/fs/efs . Test original independently created IRIX images, both later magic values, direct and indirect extent transitions, cylinder boundary, bad checksum, invalid slot, overlapping directory entries, link aliases, bitmap disagreement, journal header corruption, replay interruptions, mixed-sector writes and no-space relocation. Compare payload and metadata to an independent reader; qualify actual packaged bytes and firmware separately. The remaining historical dialects, native maximum extent constraints and inline symlink cases require further primary-source validation.
 
-The PDF preserves the earlier design and historical documents as explicitly historical appendices.
-
-SGI's EFS preceded XFS in IRIX; XFS's transaction and allocation-group semantics are not interchangeable with EFS.
+Historical design evidence is integrated into Current Infiltrator provider scope and the private journal sections. Original SGI semantics are separate from that project-specific extension.
 
 Retained source: https://github.com/Infiltrator-Projects/Filesystems/blob/101026021d9088d80b7f0f472d9061f0e2c688a3/native/filesystems/efs/linux/efs.h (blob 918d2b9abb).
