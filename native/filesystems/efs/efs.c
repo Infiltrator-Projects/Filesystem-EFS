@@ -1022,7 +1022,11 @@ static const IfsFsGroupHeaderV2 *group(uint32_t id,uint32_t lo,uint32_t hi)
 __attribute__((used,section(".ifsmeta")))static const char identity[]="IFS-MODULE:efs:common2";
 static const IfsFsModuleApiV2 api={
     .abi_version=2,.structure_bytes=sizeof api,.format_id="efs",
-    .runtime_profiles=IFS_FS_PROFILE_HOSTED|IFS_FS_PROFILE_FREESTANDING,
+    .runtime_profiles=IFS_FS_PROFILE_HOSTED|IFS_FS_PROFILE_FREESTANDING
+#ifdef IFS_BOOT_FIRMWARE
+        |IFS_FS_PROFILE_FREESTANDING|IFS_FS_PROFILE_FIRMWARE
+#endif
+        ,
     .group_mask=IFS_FS_GROUP_BIT(IFS_FS_GROUP_CORE)|IFS_FS_GROUP_BIT(IFS_FS_GROUP_VOLUME)|
         IFS_FS_GROUP_BIT(IFS_FS_GROUP_DEFRAG)|IFS_FS_GROUP_BIT(IFS_FS_GROUP_ALLOCATION)|
         IFS_FS_GROUP_BIT(IFS_FS_GROUP_FORMAT_PROFILE),.query_group=group};
