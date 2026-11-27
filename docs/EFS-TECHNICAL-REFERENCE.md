@@ -1,7 +1,5 @@
 # EFS: technical reference
 
-Source evidence inspected at `429f5c572d5ca28096a29132c8886f24daf195c6`. Current implementation claims are source observations, not executed qualification.
-
 ## History and scope
 
 SGI Extent File System (EFS) predates XFS and was used on IRIS/IRIX workstations and distribution media. It extends Unix inode semantics with runs of contiguous disk blocks rather than one pointer per block. Unlike XFS, EFS uses cylinder groups and a global free-block bitmap, not allocation-group free-space B+trees or the XFS log. Historical early EFS versions must be distinguished from the later 0x72959 and 0x7295a formats. The native project reader recognises the latter two. A project-private redo journal is a separate extension, not part of original SGI EFS.
@@ -41,6 +39,8 @@ Directories are extent-backed files organised into 512-byte blocks. Later direct
 The native bitmap tracks free basic blocks; the current implementation interprets set bits as free and reconciles the count with superblock totals over each group's data range. Reserved boot, superblock, bitmap, inode and replica regions cannot be allocated even if damaged bits suggest otherwise. Reconstruct ownership from every live inode, including indirect tables and directory data; count hard-linked objects once and verify directory connectivity. Distinguish crosslinked blocks, leaked allocation, referenced-free blocks, stale counters and corrupt namespace. Original EFS recovery uses structural checking and superblock replica evidence; do not infer original transactional replay. A formatter must establish correct group geometry, inode tables, bitmap, root and replica before publishing a valid primary.
 
 ## Current Infiltrator provider scope
+
+Source evidence inspected at `429f5c572d5ca28096a29132c8886f24daf195c6`. Current implementation claims are source observations, not executed qualification.
 
 The inspected independent source contains CORE probe/mount/unmount/stat/list/read/write/create/remove/rename/truncate; VOLUME query, get/set label, sync, format, check; ALLOCATION map; FORMAT_PROFILE and DEFRAG map/plan/execute/verify/recover/release-plan. Only the hosted runtime profile is declared. Clean foreign EFS is read-only; writable mounts require the project journal and admitted geometry, with durability and exclusivity checked by transaction paths. Native format uses the 0x72959 variant, a six-character printable label limit and multi-extent layout. A Common V2 group descriptor is not release or firmware qualification. The current provider has one gated session; callers must respect operation masks and host-specific restrictions.
 

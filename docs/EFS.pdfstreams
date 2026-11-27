@@ -182,6 +182,8 @@ BT /F2 22 Tf 43 784 Td (EFS - technical reference) Tj ET
 0.08 0.14 0.20 rg BT /F3 10 Tf 43 608 Td (printable label limit and multi-extent layout. A Common V2 group descriptor is not) Tj ET
 0.08 0.14 0.20 rg BT /F3 10 Tf 43 594 Td (release or firmware qualification. The current provider has one gated session;) Tj ET
 0.08 0.14 0.20 rg BT /F3 10 Tf 43 580 Td (callers must respect operation masks and host-specific restrictions.) Tj ET
+0.08 0.14 0.20 rg BT /F3 10 Tf 43 554 Td (Source evidence inspected at 429f5c572d5ca28096a29132c8886f24daf195c6. Current) Tj ET
+0.08 0.14 0.20 rg BT /F3 10 Tf 43 540 Td (implementation claims are source observations, not executed qualification.) Tj ET
 0.2 0.3 0.4 rg BT /F1 9 Tf 43 32 Td (Historical development and engineering reference | 11) Tj ET
 
 %%Page
