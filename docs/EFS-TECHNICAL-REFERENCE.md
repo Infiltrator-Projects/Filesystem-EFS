@@ -26,6 +26,8 @@ Each inode is 128 bytes, four per basic block. Let I be inode blocks per cylinde
 
 Each eight-byte descriptor stores an extent magic byte at 0, 24-bit physical basic-block address at 1, one-byte block count at 4 and 24-bit logical block offset at 5. The ordinary extent magic is zero. A nonempty run cannot cross the admitted cylinder-group data boundary or overlap its inode table. The one-byte length representation does not make every value legal for every SGI revision; native allocation constraints and the original manual govern writer limits. For at most twelve extents, descriptors directly map payload. For more than twelve, inode descriptors identify extent-table runs; the first descriptor's logical field gives the number of table descriptors. Each table block holds 64 extent records. Read only the declared number; validate table ownership separately from payload ownership.
 
+Cross-check indirect extent counts, extent magic and the cylinder-group ownership boundaries. The original Linux EFS reader describes a four-byte directory block header and big-endian directory magic 0xbeef; directory slot offsets must not point into that header.
+
 ## File reads and mapping validation
 
 Build an extent list in logical order and check it against the declared file size, actual block allocation and all reserved regions. A logical byte position p selects basic block floor(p/512) and byte offset p mod 512; find the run containing that logical block. Physical byte offset is 512*(physical_start + logical_block - logical_start) + remainder. For logical run [20,24) mapped at physical block 600, logical block 22 maps to block 602. For final partial blocks, truncate the read to EOF. Missing runs, duplicated physical ownership, illegal gaps or noncanonical extent order must not silently produce data. The current admitted reader validates descriptor and block counts and rejects unsupported layouts.
@@ -54,8 +56,16 @@ Build a prospective native bitmap without reusing old owned blocks before commit
 
 The native plan simulates ownership from the actual bitmap without trusting external locations. It visits hard-linked files once, verifies the source extent layout and calculates a payload CRC before relocation. Execute moves one file at a time using copy-on-write allocation and redo-protected metadata; old extents remain owned until publication. Verify checks the intended physical layout and rereads payload bytes, then performs a structural consistency pass. A file may have multiple consecutive native descriptors despite a physically contiguous run because descriptor lengths are bounded. Distinguish physical fragmentation from descriptor count. Any growth reservation metadata is provider-specific and must remain protected from ordinary allocation; do not expose a private metadata file as a user file or claim reservations on foreign media.
 
+## Implementation and qualification boundary
+
+The independent provider uses Common V2: https://github.com/Infiltrator-Projects/Libraries/blob/main/docs/FILESYSTEM_COMMON_ABI_V2.md . Negotiate actual operation masks and media profiles. Distinguish unsupported, corrupt, I/O and stale-handle results. Require bounded host I/O, exclusive unmounted ownership and durable flush before mutation. Test Media and Defragmenter consume the same engine, not separate format parsers. Hosted and freestanding binaries, relocation, recovery, BOOT, kernel integration and packages require separate exact-source evidence. Current support belongs to the repository README and qualification records. The intended package paths are /System/Filesystems/ and /System/Resources/Documentation/; the reference is not an installation or release-status claim.
+
 ## References and independent test design
 
 SGI original manual: https://www.typewritten.org/Manual/SGI/IRIX/6.5.3f/man4/efs.html ; inode layout https://techpubs.jurassic.nl/manpages_0530/cat4/inode.html ; architecture https://tech-pubs.net/SGI_Admin/books/IA_DiskFiles/sgi_html/apa.html ; reader cross-check https://github.com/torvalds/linux/tree/v6.12/fs/efs . Test original independently created IRIX images, both later magic values, direct and indirect extent transitions, cylinder boundary, bad checksum, invalid slot, overlapping directory entries, link aliases, bitmap disagreement, journal header corruption, replay interruptions, mixed-sector writes and no-space relocation. Compare payload and metadata to an independent reader; qualify actual packaged bytes and firmware separately. The remaining historical dialects, native maximum extent constraints and inline symlink cases require further primary-source validation.
 
 The PDF preserves the earlier design and historical documents as explicitly historical appendices.
+
+SGI's EFS preceded XFS in IRIX; XFS's transaction and allocation-group semantics are not interchangeable with EFS.
+
+Retained source: https://github.com/Infiltrator-Projects/Filesystems/blob/101026021d9088d80b7f0f472d9061f0e2c688a3/native/filesystems/efs/linux/efs.h (blob 918d2b9abb).
