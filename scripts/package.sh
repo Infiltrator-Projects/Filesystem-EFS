@@ -6,7 +6,8 @@ out=$(realpath -m "${1:-dist}")
 mkdir -p "$out"
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-install -Dm755 build/EFS.so "$stage/System/Filesystems/EFS.so"
+make carrier
+install -Dm755 build/carrier/EFS.so "$stage/System/Filesystems/EFS.so"
 install -Dm644 preview/Filesystem-EFS.pdf "$stage/System/Resources/Documentation/Filesystem-EFS.pdf"
 mkdir -p "$stage/DEBIAN"
 cat > "$stage/DEBIAN/control" <<EOF
